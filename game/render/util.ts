@@ -1,6 +1,6 @@
 // Rendering helpers shared by the Babylon view layer.
 import {
-  Color3, Color4, Matrix, Mesh, Quaternion, Scene, StandardMaterial, Vector3, VertexBuffer,
+  Color3, Color4, Matrix, Mesh, Quaternion, Scene, StandardMaterial, Vector3, VertexBuffer, VertexData,
 } from "@babylonjs/core";
 
 /** Sim (x right, y down) → Babylon (x right, y up, z forward/north). */
@@ -117,14 +117,85 @@ export function setThinInstances(mesh: Mesh, list: Placement[]) {
   if (list.length === 0) { mesh.setEnabled(false); return; }
   const buf = new Float32Array(list.length * 16);
   list.forEach((p, i) => {
-    tmpS.set(p.sx, p.sy, p.sz);
-    Quaternion.RotationYawPitchRollToRef(p.ry, p.rx ?? 0, p.rz ?? 0, tmpQ);
-    toB(p.x, p.y, p.h ?? 0, tmpT);
-    Matrix.ComposeToRef(tmpS, tmpQ, tmpT, tmpM);
+    placementMatrix(p, tmpM);
     tmpM.copyToArray(buf, i * 16);
   });
   mesh.thinInstanceSetBuffer("matrix", buf, 16, true);
   mesh.thinInstanceRefreshBoundingInfo(false);
+}
+
+function placementMatrix(p: Placement, out: Matrix) {
+  tmpS.set(p.sx, p.sy, p.sz);
+  Quaternion.RotationYawPitchRollToRef(p.ry, p.rx ?? 0, p.rz ?? 0, tmpQ);
+  toB(p.x, p.y, p.h ?? 0, tmpT);
+  Matrix.ComposeToRef(tmpS, tmpQ, tmpT, out);
+}
+
+/** One source for {@link bakeStatic}: a mesh stamped at each placement (or once, at its own transform). */
+export interface BakePart { mesh: Mesh; list?: Placement[] }
+
+const tmpW = new Matrix(), tmpN = new Matrix(), tmpV = new Vector3(), tmpV2 = new Vector3();
+
+/**
+ * Merges static, vertex-coloured geometry that shares one material and shadow
+ * setup into a single mesh: one draw call per pass instead of one per variant.
+ * Sources are disposed. Normals use the inverse-transpose (exactly what the
+ * thin-instance shader path computes), so lighting is unchanged.
+ */
+export function bakeStatic(name: string, scene: Scene, parts: BakePart[], mat: StandardMaterial): Mesh {
+  let nv = 0, ni = 0;
+  for (const { mesh, list } of parts) {
+    const k = list ? list.length : 1;
+    nv += mesh.getTotalVertices() * k;
+    ni += (mesh.getIndices()?.length ?? 0) * k;
+  }
+  const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3), col = new Float32Array(nv * 4);
+  const idx = nv > 65535 ? new Uint32Array(ni) : new Uint16Array(ni);
+  let vo = 0, io = 0;
+  for (const { mesh, list } of parts) {
+    const sp = mesh.getVerticesData(VertexBuffer.PositionKind)!;
+    const sn = mesh.getVerticesData(VertexBuffer.NormalKind)!;
+    const sc = mesh.getVerticesData(VertexBuffer.ColorKind);
+    const si = mesh.getIndices()!;
+    const n = mesh.getTotalVertices();
+    const local = mesh.computeWorldMatrix(true);
+    const stamps = list ?? [null];
+    for (const p of stamps) {
+      if (p) { placementMatrix(p, tmpM); tmpM.multiplyToRef(local, tmpW); } else tmpW.copyFrom(local);
+      tmpW.invertToRef(tmpN);
+      tmpN.transposeToRef(tmpN);
+      for (let i = 0; i < n; i++) {
+        tmpV.set(sp[i * 3], sp[i * 3 + 1], sp[i * 3 + 2]);
+        Vector3.TransformCoordinatesToRef(tmpV, tmpW, tmpV2);
+        pos[(vo + i) * 3] = tmpV2.x; pos[(vo + i) * 3 + 1] = tmpV2.y; pos[(vo + i) * 3 + 2] = tmpV2.z;
+        tmpV.set(sn[i * 3], sn[i * 3 + 1], sn[i * 3 + 2]);
+        Vector3.TransformNormalToRef(tmpV, tmpN, tmpV2);
+        tmpV2.normalize();
+        nrm[(vo + i) * 3] = tmpV2.x; nrm[(vo + i) * 3 + 1] = tmpV2.y; nrm[(vo + i) * 3 + 2] = tmpV2.z;
+        if (sc) {
+          const cs = sc.length === n * 3 ? 3 : 4;
+          col[(vo + i) * 4] = sc[i * cs]; col[(vo + i) * 4 + 1] = sc[i * cs + 1]; col[(vo + i) * 4 + 2] = sc[i * cs + 2];
+          col[(vo + i) * 4 + 3] = cs === 4 ? sc[i * cs + 3] : 1;
+        } else col.fill(1, (vo + i) * 4, (vo + i) * 4 + 4);
+      }
+      // A mirrored stamp (negative determinant) flips winding; keep faces front-facing.
+      const flip = tmpW.determinant() < 0;
+      for (let t = 0; t < si.length; t += 3) {
+        idx[io++] = si[t] + vo;
+        idx[io++] = (flip ? si[t + 2] : si[t + 1]) + vo;
+        idx[io++] = (flip ? si[t + 1] : si[t + 2]) + vo;
+      }
+      vo += n;
+    }
+    mesh.dispose();
+  }
+  const m = new Mesh(name, scene);
+  const vd = new VertexData();
+  vd.positions = pos; vd.normals = nrm; vd.colors = col; vd.indices = idx;
+  vd.applyToMesh(m);
+  m.material = mat;
+  m.isPickable = false;
+  return m;
 }
 
 export function c4(c: Color3, a = 1) {

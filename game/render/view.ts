@@ -3,7 +3,7 @@
 //  World (plain data) and poses meshes, lights and the camera to match.
 // ─────────────────────────────────────────────────────────────────────────────
 import {
-  Color3, Color4, DirectionalLight, Engine, FreeCamera, GlowLayer, HemisphericLight, InstancedMesh, Matrix, Mesh,
+  AbstractMesh, Color3, Color4, DirectionalLight, Engine, FreeCamera, GlowLayer, HemisphericLight, InstancedMesh, Matrix, Mesh,
   MeshBuilder, PointLight, Scene, ShadowGenerator, StandardMaterial, TransformNode, Vector3, VertexBuffer, VertexData,
 } from "@babylonjs/core";
 import type { Marker } from "../autopilot";
@@ -63,6 +63,13 @@ export class GameView {
   private hemi: HemisphericLight;
   private sun: DirectionalLight;
   private shadows: ShadowGenerator;
+  private glow: GlowLayer;
+  /** Reused per-frame scratch (avoids GC churn in the render loop). */
+  private trailBuf = new Float32Array((TRAIL_SEGS + 1) * 6);
+  private tmpGoal = new Vector3();
+  private tmpTarget = new Vector3();
+  private torchOrder: number[] = [];
+  private torchDist: number[] = [];
   private lib: Lib;
   private stat: StaticWorld;
   private particles: Particles;
@@ -113,16 +120,34 @@ export class GameView {
   private fxT = 0;
   private gooT = 0;
 
+  /** Live render stats for the on-screen FPS counter (refreshed ~2×/s). */
+  readonly stats = { fps: 0, frameMs: 0, cpuMs: 0, drawCalls: 0, activeMeshes: 0, renderScale: 1 };
+  private statFrames = 0;
+  private statT0 = 0;
+  private statCpu = 0;
+  private statDraws = 0;
+  private statLast = 0;
+  private statMaxGap = 0;
+  /** Render pixels per CSS pixel (adaptive: steps down on high-DPI screens that can't keep up). */
+  private renderScale = 1;
+  private slowWindows = 0;
+
   constructor(canvas: HTMLCanvasElement) {
     const engine = new Engine(canvas, true, { stencil: true, antialias: true, preserveDrawingBuffer: false }, true);
     // Phones: cap the render resolution a little lower to keep a steady frame rate.
     const mobile = window.matchMedia?.("(pointer: coarse)").matches ?? false;
-    engine.setHardwareScalingLevel(1 / Math.min(mobile ? 1.5 : 2, window.devicePixelRatio || 1));
+    this.renderScale = Math.min(mobile ? 1.5 : 2, window.devicePixelRatio || 1);
+    engine.setHardwareScalingLevel(1 / this.renderScale);
+    this.stats.renderScale = this.renderScale;
     this.engine = engine;
-    const scene = new Scene(engine);
+    const scene = new Scene(engine, { useGeometryUniqueIdsMap: true, useMaterialMeshMap: true, useClonedMeshMap: true });
     this.scene = scene;
     scene.clearColor = new Color4(0.66, 0.86, 0.94, 1);
+    // Taps are resolved against the ground plane in pick(); Babylon's own
+    // per-event mesh picking is pure overhead.
     scene.skipPointerMovePicking = true;
+    scene.skipPointerDownPicking = true;
+    scene.skipPointerUpPicking = true;
     scene.ambientColor = new Color3(0, 0, 0);
 
     const cam = new FreeCamera("cam", new Vector3(HERO_SPAWN.x, CAM_HEIGHT, -HERO_SPAWN.y - CAM_BACK), scene);
@@ -149,10 +174,10 @@ export class GameView {
 
     const glow = new GlowLayer("glow", scene, { mainTextureSamples: 2, blurKernelSize: 32 });
     glow.intensity = 0.55;
+    this.glow = glow;
 
     this.lib = makeLib(scene);
     this.stat = buildStatic(scene, this.lib);
-    glow.addExcludedMesh(this.stat.water);
     for (const m of this.stat.casters) sg.addShadowCaster(m, false);
 
     this.particles = new Particles(scene);
@@ -266,7 +291,20 @@ export class GameView {
     this.lockRing.name = "lockRing";
     this.lockRing.material = makeMat(scene, "lockRingMat", hex("#ff5a6a"), { emissive: hex("#ff2d48"), unlit: true });
     for (const m of [this.moveRing, this.lockRing]) { m.isVisible = false; m.isPickable = false; }
+
+    // Glow: only meshes that can actually emit are rendered into the glow
+    // texture (by default Babylon re-draws the entire scene into it as black).
+    for (const m of scene.meshes) this.glowIfEmissive(m);
+    scene.onMeshRemovedObservable.add((m) => this.glow.removeIncludedOnlyMesh(m as Mesh));
     this.resize();
+  }
+
+  /** Adds a mesh to the glow layer if its material has a non-black emissive colour. */
+  private glowIfEmissive(m: AbstractMesh) {
+    const mat = m.material;
+    if (m === this.stat.water || !(mat instanceof StandardMaterial)) return;
+    const e = mat.emissiveColor;
+    if (e.r + e.g + e.b > 0) this.glow.addIncludedOnlyMesh(m as Mesh);
   }
 
   resize() {
@@ -338,6 +376,7 @@ export class GameView {
       inst.rotation.y = r * Math.PI * 2;
       const s = b.kind === "pot" ? 0.95 + r * 0.15 : 0.85 + r * 0.35;
       inst.scaling.set(s, b.kind === "pot" ? s * (0.95 + r * 0.12) : s, s);
+      if (b.kind === "pot") inst.freezeWorldMatrix(); // pots never move (grass sways)
       this.breakViews.push(inst);
     }
     this.boundWorld = w;
@@ -371,7 +410,9 @@ export class GameView {
       alert = this.alertMaster.clone(`alert${e.id}`, root)!;
       alert.position.set(0, 1.15, 0);
       alert.isVisible = false;
+      this.glowIfEmissive(alert);
     }
+    this.glow.addIncludedOnlyMesh(body); // hit flash / windup glow
     const v: EnemyView = { root, body, mat, crown: cr, alert, wasAlive: e.alive, spawnT: e.minion ? 0 : 1, yaw: yawOf(e.face), puff: 0 };
     this.enemyViews.set(e.id, v);
     return v;
@@ -410,6 +451,7 @@ export class GameView {
     this.camTarget.copyFrom(t);
   }
 
+  /** Where the camera wants to look (written into a shared scratch vector). */
   private cameraGoal(w: World): Vector3 {
     const p = w.player;
     // Keep the map edges just off-screen; narrow screens follow the hero sideways.
@@ -417,8 +459,8 @@ export class GameView {
       const lo = this.halfW + 0.85, hi = mapW - this.halfW - 0.85;
       return lo >= hi ? mapW / 2 : clamp(x, lo, hi);
     };
-    if (p.map === "over") return new Vector3(follow(p.x, 48), 0, clamp(p.y, 4.6, 20.2));
-    return new Vector3(follow(p.x, 16), 0, clamp(p.y, 5.2, 18.2));
+    if (p.map === "over") return this.tmpGoal.set(follow(p.x, 48), 0, clamp(p.y, 4.6, 20.2));
+    return this.tmpGoal.set(follow(p.x, 16), 0, clamp(p.y, 5.2, 18.2));
   }
 
   // ── Events from the simulation ──
@@ -430,6 +472,7 @@ export class GameView {
 
   // ── Frame ──
   render(w: World, alpha: number, dt: number, phase: Phase, marker: Marker | null = null) {
+    const t0 = performance.now();
     this.time += dt;
     const t = this.time;
     if (w !== this.boundWorld) this.bindWorld(w);
@@ -437,9 +480,9 @@ export class GameView {
     if (p.map !== this.currentMap) this.applyMap(p.map, w);
 
     // Camera
-    let goal = this.cameraGoal(w);
+    const goal = this.cameraGoal(w);
     if (phase === "title") {
-      goal = new Vector3(HERO_SPAWN.x + Math.sin(t * 0.12) * 3.5, 0, HERO_SPAWN.y - 1.5 + Math.cos(t * 0.09) * 1.2);
+      goal.set(HERO_SPAWN.x + Math.sin(t * 0.12) * 3.5, 0, HERO_SPAWN.y - 1.5 + Math.cos(t * 0.09) * 1.2);
     }
     const k = 1 - Math.exp(-dt * 6.5);
     this.camTarget.x = lerp(this.camTarget.x, goal.x, k);
@@ -449,11 +492,11 @@ export class GameView {
     const sz = (Math.sin(t * 63.1 + 1.3) + Math.sin(t * 79.9)) * 0.5 * sh;
     const z = this.zoom;
     this.camera.position.set(this.camTarget.x + sx, CAM_HEIGHT * z + sz * 0.5, -this.camTarget.z - CAM_BACK * z + sz);
-    this.camera.setTarget(new Vector3(this.camTarget.x + sx * 0.6, 0.6, -this.camTarget.z + sz * 0.6));
+    this.camera.setTarget(this.tmpTarget.set(this.camTarget.x + sx * 0.6, 0.6, -this.camTarget.z + sz * 0.6));
 
     // Sun & shadows follow the view
-    const focus = new Vector3(this.camTarget.x, 0, -this.camTarget.z + 2);
-    this.sun.position = focus.subtract(this.sun.direction.scale(40));
+    const d = this.sun.direction;
+    this.sun.position.set(this.camTarget.x - d.x * 40, -d.y * 40, -this.camTarget.z + 2 - d.z * 40);
 
     this.poseHero(w, alpha, dt, phase);
     this.poseEnemies(w, alpha, dt);
@@ -466,7 +509,47 @@ export class GameView {
     this.fxT = this.fxT <= 0 ? 0.07 : this.fxT - dt;
 
     this.particles.update(dt);
+    const dc = (this.engine as unknown as { _drawCalls: { fetchNewFrame(): void; current: number } })._drawCalls;
+    dc.fetchNewFrame();
     this.scene.render();
+    this.trackStats(t0, dc.current);
+  }
+
+  private trackStats(t0: number, draws: number) {
+    const now = performance.now();
+    if (this.statLast) this.statMaxGap = Math.max(this.statMaxGap, now - this.statLast);
+    this.statLast = now;
+    this.statCpu += now - t0;
+    this.statDraws += draws;
+    this.statFrames++;
+    if (this.statT0 === 0) this.statT0 = now;
+    const span = now - this.statT0;
+    if (span >= 500) {
+      const n = this.statFrames;
+      this.stats.fps = (n * 1000) / span;
+      this.stats.frameMs = span / n;
+      this.stats.cpuMs = this.statCpu / n;
+      this.stats.drawCalls = Math.round(this.statDraws / n);
+      this.stats.activeMeshes = this.scene.getActiveMeshes().length;
+      this.adaptResolution(this.stats.fps, this.statMaxGap);
+      this.statFrames = 0; this.statCpu = 0; this.statDraws = 0; this.statT0 = now; this.statMaxGap = 0;
+    }
+  }
+
+  /**
+   * High-DPI screens that can't keep up get a slightly lower render scale
+   * (in 0.25 steps, never below 1 render pixel per CSS pixel). Windows with a
+   * long hitch (tab switch, map load) are ignored so one stall can't trigger it.
+   */
+  private adaptResolution(fps: number, maxGap: number) {
+    if (maxGap > 150) { this.slowWindows = 0; return; }
+    this.slowWindows = fps < 45 ? this.slowWindows + 1 : 0;
+    if (this.slowWindows < 4 || this.renderScale <= 1) return;
+    this.slowWindows = 0;
+    this.renderScale = Math.max(1, this.renderScale - 0.25);
+    this.engine.setHardwareScalingLevel(1 / this.renderScale);
+    this.stats.renderScale = this.renderScale;
+    this.resize();
   }
 
   private poseHero(w: World, alpha: number, dt: number, phase: Phase) {
@@ -558,12 +641,13 @@ export class GameView {
   }
 
   private updateTrail(a0: number, a1: number) {
-    const arr = new Float32Array((TRAIL_SEGS + 1) * 6);
+    const arr = this.trailBuf;
     const r0 = 0.42, r1 = 1.28;
     for (let i = 0; i <= TRAIL_SEGS; i++) {
       const a = a0 + (a1 - a0) * (i / TRAIL_SEGS);
-      const s = Math.sin(a), c = Math.cos(a);
-      arr.set([s * r0, 0, c * r0, s * r1, 0.02, c * r1], i * 6);
+      const s = Math.sin(a), c = Math.cos(a), o = i * 6;
+      arr[o] = s * r0; arr[o + 1] = 0; arr[o + 2] = c * r0;
+      arr[o + 3] = s * r1; arr[o + 4] = 0.02; arr[o + 5] = c * r1;
     }
     this.trail.updateVerticesData(VertexBuffer.PositionKind, arr);
     this.trail.refreshBoundingInfo();
@@ -702,6 +786,7 @@ export class GameView {
     const m = master.clone(name)!;
     m.isVisible = true;
     m.isPickable = false;
+    this.glowIfEmissive(m);
     return m;
   }
 
@@ -799,15 +884,18 @@ export class GameView {
 
   private poseBreakables(w: World) {
     const t = this.time;
-    w.breakables.forEach((b, i) => {
+    const map = this.currentMap;
+    const list = w.breakables;
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i];
       const v = this.breakViews[i];
-      if (!v) return;
+      if (!v || b.map !== map) continue;
       const show = !b.broken;
       if (v.isEnabled() !== show) v.setEnabled(show);
-      if (!show || b.kind !== "grass") return;
+      if (!show || b.kind !== "grass") continue;
       v.rotation.z = Math.sin(t * 28) * 0.28 * b.wobble + Math.sin(t * 1.4 + b.x) * 0.04;
       v.rotation.x = Math.cos(t * 1.1 + b.y) * 0.04;
-    });
+    }
   }
 
   private posePickups(w: World, alpha: number) {
@@ -867,19 +955,31 @@ export class GameView {
 
     // Torches: flicker, and the 4 nearest get real point lights.
     const px = w.player.x, py = w.player.y;
-    const ranked = s.torchFlames
-      .map((f) => ({ f, d: (f.pos.x - px) ** 2 + (-f.pos.z - py) ** 2 }))
-      .sort((a, b) => a.d - b.d);
-    for (const { f } of ranked) {
+    const flames = s.torchFlames, order = this.torchOrder, dist = this.torchDist;
+    const { outerBuf: ob, innerBuf: ib } = s.flames;
+    for (let i = 0; i < flames.length; i++) {
+      const f = flames[i];
+      // Insertion sort by distance (a handful of torches; no allocations).
+      const d = (f.pos.x - px) ** 2 + (-f.pos.z - py) ** 2;
+      let j = i;
+      while (j > 0 && dist[j - 1] > d) { dist[j] = dist[j - 1]; order[j] = order[j - 1]; j--; }
+      dist[j] = d; order[j] = i;
+      // Flicker: scale-only matrices written straight into the instance buffers.
       const fl = 1 + Math.sin(t * 19 + f.seed) * 0.12 + Math.sin(t * 31 + f.seed * 2) * 0.07;
-      f.outer.scaling.set(fl, 1.5 * fl * (1 + Math.sin(t * 23 + f.seed) * 0.08), fl);
-      f.inner.scaling.setAll(fl * 0.95);
+      const o = i * 16;
+      ob[o] = fl; ob[o + 5] = 1.5 * fl * (1 + Math.sin(t * 23 + f.seed) * 0.08); ob[o + 10] = fl; ob[o + 15] = 1;
+      ob[o + 12] = f.pos.x; ob[o + 13] = f.pos.y; ob[o + 14] = f.pos.z;
+      const si = fl * 0.95;
+      ib[o] = si; ib[o + 5] = si; ib[o + 10] = si; ib[o + 15] = 1;
+      ib[o + 12] = f.pos.x; ib[o + 13] = f.pos.y - 0.02; ib[o + 14] = f.pos.z;
     }
+    s.flames.outer.thinInstanceBufferUpdated("matrix");
+    s.flames.inner.thinInstanceBufferUpdated("matrix");
     s.torchLights.forEach((l, i) => {
-      const r = ranked[i];
-      if (!r) { l.setEnabled(false); return; }
-      l.position.copyFrom(r.f.pos);
-      l.intensity = 0.85 + Math.sin(t * 17 + r.f.seed) * 0.1 + Math.sin(t * 29 + r.f.seed) * 0.06;
+      if (i >= flames.length) { l.setEnabled(false); return; }
+      const f = flames[order[i]];
+      l.position.copyFrom(f.pos);
+      l.intensity = 0.85 + Math.sin(t * 17 + f.seed) * 0.1 + Math.sin(t * 29 + f.seed) * 0.06;
     });
   }
 }

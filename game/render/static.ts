@@ -9,7 +9,7 @@ import {
 import {
   Lib, PAL, decoGrass, flower, hedge, keyMesh, lanternPost, leafyTree, pineTree, rock, signpost,
 } from "./models";
-import { colorize, hash2, hex, makeMat, merge, Placement, setThinInstances, toB } from "./util";
+import { BakePart, bakeStatic, colorize, hash2, hex, makeMat, merge, Placement, setThinInstances, toB } from "./util";
 
 // ── Palette per overworld screen ────────────────────────────────────────────
 const AREA_GRASS = [
@@ -121,7 +121,9 @@ export interface StaticWorld {
   water: Mesh;
   waterMat: StandardMaterial;
   glints: Mesh;
-  torchFlames: { outer: Mesh; inner: Mesh; pos: Vector3; seed: number }[];
+  torchFlames: { pos: Vector3; seed: number }[];
+  /** Thin-instanced flame meshes: one matrix per torch, written by the view each frame. */
+  flames: { outer: Mesh; inner: Mesh; outerBuf: Float32Array; innerBuf: Float32Array };
   torchLights: PointLight[];
   gate: TransformNode;
   chestLid: TransformNode;
@@ -189,11 +191,8 @@ export function buildStatic(scene: Scene, lib: Lib): StaticWorld {
   const padMaster = MeshBuilder.CreateCylinder("pad", { height: 0.02, diameter: 0.42, tessellation: 7 }, scene);
   colorize(padMaster, hex("#4f9a3e"));
   padMaster.convertToFlatShadedMesh();
-  padMaster.material = lib.vc;
-  padMaster.parent = overRoot;
   const padP: Placement[] = [];
   const blossomMaster = flower(scene, lib, hex("#ffb3c8"), 99);
-  blossomMaster.parent = overRoot;
   const blossomP: Placement[] = [];
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     if (over.tiles[y][x] !== "~") continue;
@@ -206,8 +205,6 @@ export function buildStatic(scene: Scene, lib: Lib): StaticWorld {
     }
   }
   setThinInstances(glintMaster, glintP);
-  setThinInstances(padMaster, padP);
-  setThinInstances(blossomMaster, blossomP);
 
   // ── Foliage & rocks ──
   const pines = [0, 1, 2, 3].map((v) => pineTree(scene, lib, v));
@@ -273,14 +270,7 @@ export function buildStatic(scene: Scene, lib: Lib): StaticWorld {
       }
     }
   }
-  pines.forEach((m, i) => { setThinInstances(m, pineP[i]); m.parent = overRoot; casters.push(m); });
-  leafies.forEach((m, i) => { setThinInstances(m, leafyP[i]); m.parent = overRoot; casters.push(m); });
-  rocks.forEach((m, i) => { setThinInstances(m, rockP[i]); m.parent = overRoot; casters.push(m); m.receiveShadows = true; });
-  cliffs.forEach((m, i) => { setThinInstances(m, cliffP[i]); m.parent = overRoot; casters.push(m); m.receiveShadows = true; });
-  hedges.forEach((m, i) => { setThinInstances(m, hedgeP[i]); m.parent = overRoot; casters.push(m); m.receiveShadows = true; });
   const pebble = rock(scene, lib, 20);
-  setThinInstances(pebble, pebbleP);
-  pebble.parent = overRoot;
 
   // ── Ground cover: flowers + decorative blades ──
   const flowerMasters = PAL.flowers.map((c, i) => flower(scene, lib, c, i));
@@ -305,8 +295,6 @@ export function buildStatic(scene: Scene, lib: Lib): StaticWorld {
       }
     }
   }
-  flowerMasters.forEach((m, i) => { setThinInstances(m, flowerP[i]); m.parent = overRoot; });
-  decoMasters.forEach((m, i) => { setThinInstances(m, decoP[i]); m.parent = overRoot; });
 
   // ── Lanterns & signs ──
   const lantern = lanternPost(scene, lib);
@@ -318,23 +306,51 @@ export function buildStatic(scene: Scene, lib: Lib): StaticWorld {
     if (c === "l") lanternP.push({ x: x + 0.5, y: y + 0.5, sx: 1, sy: 1, sz: 1, ry: hash2(x, y, 210) * 0.5 });
     if (c === "n") signP.push({ x: x + 0.5, y: y + 0.5, sx: 1, sy: 1, sz: 1, ry: (hash2(x, y, 211) - 0.5) * 0.3 });
   }
-  setThinInstances(lantern.body, lanternP);
   setThinInstances(lantern.lamp, lanternP);
-  setThinInstances(sign, signP);
-  [lantern.body, lantern.lamp, sign].forEach((m) => { m.parent = overRoot; });
-  casters.push(lantern.body, sign);
+  lantern.lamp.parent = overRoot;
 
   // ── Hearthside cottage ──
-  const chimney = buildCottage(scene, lib, overRoot, casters);
+  const { chimney, frames } = buildCottage(scene, lib, overRoot, casters);
 
   // ── Brambleford bridge ──
-  buildBridge(scene, lib, over, overRoot, casters);
+  const bridge = buildBridge(scene, lib, over);
 
   // ── Barrow arch ──
-  buildArch(scene, lib, over, overRoot, casters);
+  const arch = buildArch(scene, lib, over, overRoot);
+
+  // ── Bake the static props ──
+  // Everything static that shares a material and shadow role becomes ONE mesh,
+  // so the whole forest/rockery/meadow is a handful of draw calls per pass.
+  const stamp = (ms: Mesh[], ls: Placement[][]): BakePart[] => ms.map((mesh, i) => ({ mesh, list: ls[i] }));
+  const trees = bakeStatic("overTrees", scene, [
+    ...stamp(pines, pineP), ...stamp(leafies, leafyP), { mesh: lantern.body, list: lanternP }, { mesh: sign, list: signP },
+  ], lib.vc); // cast, don't receive
+  const stones = bakeStatic("overStones", scene, [
+    ...stamp(rocks, rockP), ...stamp(cliffs, cliffP), ...stamp(hedges, hedgeP),
+    ...(bridge ? [{ mesh: bridge }] : []), ...(arch ? [{ mesh: arch }] : []),
+  ], lib.vc); // cast + receive
+  stones.receiveShadows = true;
+  const cover = bakeStatic("overCover", scene, [
+    { mesh: pebble, list: pebbleP }, { mesh: padMaster, list: padP }, { mesh: blossomMaster, list: blossomP },
+    ...stamp(flowerMasters, flowerP), { mesh: frames },
+  ], lib.vc); // neither
+  const blades = bakeStatic("overBlades", scene, stamp(decoMasters, decoP), lib.vcTwo);
+  for (const m of [trees, stones, cover, blades]) m.parent = overRoot;
+  casters.push(trees, stones);
 
   // ── Dungeon ──
   const dz = buildDungeon(scene, lib, dungeonRoot, casters);
+
+  // Static scenery never moves: freeze its world matrices so Babylon skips
+  // recomputing them (and their bounds) every frame.
+  const dynamic = new Set<TransformNode>([water, dz.chestSeal, dz.key, dz.gate, dz.chestLid]);
+  const freeze = (n: TransformNode) => {
+    if (dynamic.has(n)) return;
+    n.freezeWorldMatrix();
+    for (const c of n.getChildTransformNodes(true)) freeze(c);
+  };
+  freeze(overRoot);
+  freeze(dungeonRoot);
 
   return {
     overRoot, dungeonRoot, casters, water, waterMat, glints: glintMaster, chimney,
@@ -343,7 +359,7 @@ export function buildStatic(scene: Scene, lib: Lib): StaticWorld {
 }
 
 // ── Set pieces ──────────────────────────────────────────────────────────────
-function buildCottage(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh[]): Vector3 {
+function buildCottage(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh[]): { chimney: Vector3; frames: Mesh } {
   const t = MAPS.over.tiles;
   let minX = 99, minY = 99, maxX = -1, maxY = -1;
   t.forEach((row, y) => [...row].forEach((c, x) => {
@@ -400,27 +416,33 @@ function buildCottage(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh
   m.parent = root;
   m.receiveShadows = true;
   casters.push(m);
-  // Glowing windows
+  // Glowing windows (both panes share one mesh; frames get baked with the static props)
   const winMat = makeMat(scene, "window", hex("#ffe9a8"), { emissive: hex("#f5c25a"), unlit: true });
+  const panes: Mesh[] = [], frameParts: Mesh[] = [];
   for (const wx of [0.45, 1.0]) {
     const win = MeshBuilder.CreateBox("win", { width: 0.34, height: 0.34, depth: 0.04 }, scene);
-    win.material = winMat;
     win.position = toB(cx + wx - 0.2, cy + d / 2 + 0.03, 0.72);
-    win.parent = root;
+    panes.push(win);
     const frame = MeshBuilder.CreateBox("winf", { width: 0.42, height: 0.06, depth: 0.06 }, scene);
-    colorize(frame, beamC); frame.material = lib.vc;
+    colorize(frame, beamC);
     frame.position = toB(cx + wx - 0.2, cy + d / 2 + 0.05, 0.72);
-    frame.parent = root;
+    frameParts.push(frame);
   }
-  return toB(cx + w / 2 - 0.55, cy - 0.25, y0 + rh * 0.75 + 0.45);
+  const windows = Mesh.MergeMeshes(panes, true, true)!;
+  windows.name = "windows";
+  windows.material = winMat;
+  windows.parent = root;
+  const frames = Mesh.MergeMeshes(frameParts, true, true)!;
+  frames.name = "winFrames";
+  return { chimney: toB(cx + w / 2 - 0.55, cy - 0.25, y0 + rh * 0.75 + 0.45), frames };
 }
 
-function buildBridge(scene: Scene, lib: Lib, over: ParsedMap, root: TransformNode, casters: Mesh[]) {
+function buildBridge(scene: Scene, lib: Lib, over: ParsedMap): Mesh | undefined {
   let minX = 99, minY = 99, maxX = -1, maxY = -1;
   over.tiles.forEach((row, y) => [...row].forEach((c, x) => {
     if (c === "=") { minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); }
   }));
-  if (maxX < 0) return;
+  if (maxX < 0) return undefined;
   const parts: Mesh[] = [];
   const x0 = minX - 0.25, x1 = maxX + 1.25;
   const y0 = minY + 0.02, y1 = maxY + 0.98;
@@ -441,16 +463,13 @@ function buildBridge(scene: Scene, lib: Lib, over: ParsedMap, root: TransformNod
       parts.push(colorize(post, PAL.woodDark));
     }
   }
-  const m = merge("bridge", parts, lib.vc, 0.05, 31);
-  m.parent = root;
-  m.receiveShadows = true;
-  casters.push(m);
+  return merge("bridge", parts, lib.vc, 0.05, 31);
 }
 
-function buildArch(scene: Scene, lib: Lib, over: ParsedMap, root: TransformNode, casters: Mesh[]) {
+function buildArch(scene: Scene, lib: Lib, over: ParsedMap, root: TransformNode): Mesh | undefined {
   let dx = -1, dy = -1;
   over.tiles.forEach((row, y) => { const i = row.indexOf("D"); if (i >= 0) { dx = i; dy = y; } });
-  if (dx < 0) return;
+  if (dx < 0) return undefined;
   const cx = dx + 0.5, cy = dy + 0.5;
   const stone = hex("#8b8578"), stoneDark = hex("#6b665c");
   const parts: Mesh[] = [];
@@ -476,9 +495,6 @@ function buildArch(scene: Scene, lib: Lib, over: ParsedMap, root: TransformNode,
     parts.push(colorize(moss, hex("#6f9a4a")));
   }
   const m = merge("arch", parts, lib.vc, 0.1, 41);
-  m.parent = root;
-  m.receiveShadows = true;
-  casters.push(m);
   // Dark mouth + sun emblem hinting at the treasure within.
   const mouth = MeshBuilder.CreateBox("mouth", { width: 1.3, height: 2.0, depth: 0.1 }, scene);
   mouth.material = makeMat(scene, "mouthMat", hex("#0d0b10"), { unlit: true });
@@ -489,6 +505,7 @@ function buildArch(scene: Scene, lib: Lib, over: ParsedMap, root: TransformNode,
   sun.material = makeMat(scene, "emblemMat", hex("#ffd34d"), { emissive: hex("#b87a10") });
   sun.position = toB(cx, cy + 0.1 + 0.5, 2.35);
   sun.parent = root;
+  return m;
 }
 
 function buildDungeon(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh[]) {
@@ -515,12 +532,13 @@ function buildDungeon(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh
   carpet.receiveShadows = true;
   carpet.parent = root;
   const trimMat = makeMat(scene, "carpetTrim", PAL.goldDark);
-  for (const sx of [-0.78, 0.78]) {
+  const trims = Mesh.MergeMeshes([-0.78, 0.78].map((sx) => {
     const tr = MeshBuilder.CreateBox("ctrim", { width: 0.07, height: 0.025, depth: GATE_ROW - CHEST_POS.y - 0.4 }, scene);
-    tr.material = trimMat;
     tr.position = toB(8 + sx, (CHEST_POS.y + 0.4 + GATE_ROW) / 2, 0.014);
-    tr.parent = root;
-  }
+    return tr;
+  }), true, true)!;
+  trims.material = trimMat;
+  trims.parent = root;
 
   // Walls: only those touching floor; south-facing walls are cut low (ALttP cutaway).
   const wallVariants = [0, 1, 2].map((v) => {
@@ -530,9 +548,6 @@ function buildDungeon(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh
     const side = PAL.wall.scale(0.92 + v * 0.06);
     colorize(b, (_x, _y, _z, ny) => (ny > 0.5 ? PAL.wallTop : side));
     b.convertToFlatShadedMesh();
-    b.material = lib.vc;
-    b.parent = root;
-    b.receiveShadows = true;
     return b;
   });
   const wallP: Placement[][] = [[], [], []];
@@ -550,7 +565,6 @@ function buildDungeon(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh
     const v = Math.floor(hash2(x, y, 7) * 3);
     wallP[v].push({ x: x + 0.5, y: y + 0.5, sx: 1, sy: h + (h > 1 ? hash2(x, y, 8) * 0.1 : 0), sz: 1, ry: 0 });
   }
-  wallVariants.forEach((b, i) => setThinInstances(b, wallP[i]));
 
   // Pillars: one squat column per tile, so groups read as colonnades.
   const pillarParts: Mesh[] = [];
@@ -593,23 +607,24 @@ function buildDungeon(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh
     pillarParts.push(colorize(r, hex("#6a6574")));
   }
   const props = merge("dProps", pillarParts, lib.vc, 0.08, 51);
-  props.parent = root;
-  props.receiveShadows = true;
-  casters.push(props);
 
-  // Jelly puddles in the boss room
+  // Jelly puddles in the boss room (one mesh)
   const puddleMat = makeMat(scene, "puddle", PAL.king.scale(0.7), { spec: 0.8, alpha: 0.85 });
-  for (let i = 0; i < 5; i++) {
+  const puddles = Mesh.MergeMeshes([0, 1, 2, 3, 4].map((i) => {
     const p = MeshBuilder.CreateCylinder("puddle", { height: 0.02, diameter: 0.4 + hash2(i, 20) * 0.5, tessellation: 7 }, scene);
-    p.material = puddleMat;
     p.position = toB(3 + hash2(i, 21) * 10, 5 + hash2(i, 22) * 4, 0.015);
     p.scaling.z = 0.6 + hash2(i, 23) * 0.4;
-    p.parent = root;
-  }
+    return p;
+  }), true, true)!;
+  puddles.material = puddleMat;
+  puddles.parent = root;
 
-  // Torches
-  const flameOuter = makeMat(scene, "flameO", hex("#ff7a1a"), { emissive: hex("#ff6a00"), unlit: true });
-  const flameInner = makeMat(scene, "flameI", hex("#ffe27a"), { emissive: hex("#ffd35a"), unlit: true });
+  // Torches: every flame shares two thin-instanced meshes (outer + inner);
+  // the view writes their flicker straight into the matrix buffers.
+  const flameOuter = MeshBuilder.CreateIcoSphere("flame", { radius: 0.13, subdivisions: 1 }, scene);
+  flameOuter.material = makeMat(scene, "flameO", hex("#ff7a1a"), { emissive: hex("#ff6a00"), unlit: true });
+  const flameInner = MeshBuilder.CreateIcoSphere("flameIn", { radius: 0.07, subdivisions: 1 }, scene);
+  flameInner.material = makeMat(scene, "flameI", hex("#ffe27a"), { emissive: hex("#ffd35a"), unlit: true });
   const bracketParts: Mesh[] = [];
   const torchFlames: StaticWorld["torchFlames"] = [];
   m.torches.forEach((t, i) => {
@@ -623,19 +638,16 @@ function buildDungeon(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh
     cup.position = toB(t.x + t.nx * 0.18, t.y + t.ny * 0.18, fh - 0.05);
     bracketParts.push(colorize(br, hex("#3a3338")), colorize(cup, hex("#4a4048")));
     const pos = toB(t.x + t.nx * 0.18, t.y + t.ny * 0.18, fh + 0.12);
-    const outer = MeshBuilder.CreateIcoSphere("flame", { radius: 0.13, subdivisions: 1 }, scene);
-    outer.scaling.y = 1.5;
-    outer.material = flameOuter;
-    outer.position = pos.clone();
-    outer.parent = root;
-    const inner = MeshBuilder.CreateIcoSphere("flameIn", { radius: 0.07, subdivisions: 1 }, scene);
-    inner.material = flameInner;
-    inner.position = pos.add(new Vector3(0, -0.02, 0));
-    inner.parent = root;
-    torchFlames.push({ outer, inner, pos, seed: i * 1.7 });
+    torchFlames.push({ pos, seed: i * 1.7 });
   });
+  const flames = { outer: flameOuter, inner: flameInner, outerBuf: new Float32Array(torchFlames.length * 16), innerBuf: new Float32Array(torchFlames.length * 16) };
+  for (const [mesh, buf] of [[flameOuter, flames.outerBuf], [flameInner, flames.innerBuf]] as const) {
+    mesh.parent = root;
+    mesh.isPickable = false;
+    mesh.alwaysSelectAsActiveMesh = true; // instances span the dungeon; skip culling
+    mesh.thinInstanceSetBuffer("matrix", buf, 16, false);
+  }
   const brackets = merge("brackets", bracketParts, lib.vc, 0.05, 61);
-  brackets.parent = root;
 
   const torchLights: PointLight[] = [];
   for (let i = 0; i < 4; i++) {
@@ -690,8 +702,7 @@ function buildDungeon(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh
   const clasp = MeshBuilder.CreateBox("clasp", { width: 0.16, height: 0.16, depth: 0.05 }, scene);
   clasp.position.set(0, 0.46, -0.34);
   const chestBody = merge("chestBody", [colorize(cb, wood), colorize(band1, PAL.gold), colorize(band2, PAL.gold), colorize(clasp, PAL.gold)], lib.vc, 0.05, 71);
-  chestBody.parent = chestRoot;
-  casters.push(chestBody);
+  chestBody.position.copyFrom(chestRoot.position);
   const lidPivot = new TransformNode("lidPivot", scene);
   lidPivot.parent = chestRoot;
   lidPivot.position.set(0, 0.52, 0.33); // hinge on the back (north) edge
@@ -715,5 +726,14 @@ function buildDungeon(scene: Scene, lib: Lib, root: TransformNode, casters: Mesh
   key.parent = root;
   key.position = toB(KEY_PEDESTAL.x, KEY_PEDESTAL.y, 1.2);
 
-  return { torchFlames, torchLights, gate, chestLid: lidPivot, chestSeal: seal, key };
+  // Bake every static vertex-coloured piece of the dungeon into one mesh. The
+  // dungeon has no shadow-casting light, so shadow roles don't matter here.
+  const dStatic = bakeStatic("dStatic", scene, [
+    { mesh: floor }, ...wallVariants.map((mesh, i) => ({ mesh, list: wallP[i] })),
+    { mesh: props }, { mesh: brackets }, { mesh: chestBody },
+  ], lib.vc);
+  dStatic.parent = root;
+  dStatic.receiveShadows = true;
+
+  return { torchFlames, flames, torchLights, gate, chestLid: lidPivot, chestSeal: seal, key };
 }

@@ -15,6 +15,8 @@ export interface Runner {
   stop(): void;
   /** Screen (CSS px, relative to the canvas) → tapped ground point + monster under the finger. */
   pick(px: number, py: number): { x: number; y: number; enemyId: number | null } | null;
+  /** Live render stats (FPS, frame time, draw calls) for the on-screen counter. */
+  stats(): GameView["stats"];
 }
 
 export function startRunner(canvas: HTMLCanvasElement): Runner {
@@ -101,6 +103,9 @@ export function startRunner(canvas: HTMLCanvasElement): Runner {
     },
     pick(px, py) {
       return view.pick(px, py, useGame.getState().world);
+    },
+    stats() {
+      return view.stats;
     },
   };
 }

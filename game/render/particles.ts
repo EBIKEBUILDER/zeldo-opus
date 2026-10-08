@@ -1,13 +1,19 @@
 // Purely-visual particle bursts (sparks, grass bits, pot shards, poofs…).
 // They never feed back into the simulation.
-import { InstancedMesh, Mesh, MeshBuilder, Scene, TransformNode, Vector3 } from "@babylonjs/core";
+//
+// Performance: every particle kind is a single mesh drawn with thin instances.
+// Each frame we write one matrix per live particle straight into that kind's
+// Float32Array, so a 600-particle boss explosion is still ~one draw call per
+// kind, with no per-particle scene-graph nodes, culling or allocations.
+import { Matrix, Mesh, MeshBuilder, Quaternion, Scene, TransformNode, Vector3 } from "@babylonjs/core";
 import type { FxKind } from "../types";
 import { hex, makeMat, toB } from "./util";
 
 interface P {
-  mesh: InstancedMesh;
+  kind: KindDef;
   pos: Vector3;
   vel: Vector3;
+  rot: Vector3;
   life: number;
   max: number;
   size: number;
@@ -20,22 +26,37 @@ interface P {
 
 interface KindDef {
   master: Mesh;
-  pool: InstancedMesh[];
+  buf: Float32Array;
+  count: number;
 }
+
+const MAX_LIVE = 600;
+const tmpS = new Vector3(), tmpQ = new Quaternion(), tmpM = new Matrix();
 
 export class Particles {
   private kinds = new Map<string, KindDef>();
+  private kindList: KindDef[] = [];
   private live: P[] = [];
   private root: TransformNode;
+  /** Every particle master mesh (for glow-layer inclusion). */
+  readonly masters: Mesh[] = [];
 
   constructor(private scene: Scene) {
     this.root = new TransformNode("fxRoot", scene);
     const mk = (name: string, mesh: Mesh, color: string, emissive?: string, unlit = false) => {
       mesh.material = makeMat(scene, name + "Mat", hex(color), { emissive: emissive ? hex(emissive) : undefined, unlit });
-      mesh.isVisible = false;
       mesh.parent = this.root;
       mesh.isPickable = false;
-      this.kinds.set(name, { master: mesh, pool: [] });
+      // Instances fly all over the map; skip culling against the master's tiny box.
+      mesh.alwaysSelectAsActiveMesh = true;
+      mesh.doNotSyncBoundingInfo = true;
+      const k: KindDef = { master: mesh, buf: new Float32Array(16 * 32), count: 0 };
+      mesh.thinInstanceSetBuffer("matrix", k.buf, 16, false);
+      mesh.thinInstanceCount = 0;
+      mesh.isVisible = false;
+      this.kinds.set(name, k);
+      this.kindList.push(k);
+      this.masters.push(mesh);
     };
     mk("spark", MeshBuilder.CreatePolyhedron("spark", { type: 1, size: 0.07 }, scene), "#fff6c8", "#ffe27a", true);
     mk("ring", MeshBuilder.CreateTorus("ring", { diameter: 0.6, thickness: 0.05, tessellation: 14 }, scene), "#ffffff", "#fff2b0", true);
@@ -56,28 +77,14 @@ export class Particles {
     mk("goo", gooRing, "#f08ac8", "#c03a8a", true);
   }
 
-  private get(kind: string): InstancedMesh {
-    const k = this.kinds.get(kind)!;
-    const m = k.pool.pop();
-    if (m) { m.setEnabled(true); return m; }
-    const inst = k.master.createInstance(kind + "_i");
-    inst.parent = this.root;
-    inst.isPickable = false;
-    (inst as InstancedMesh & { _kind?: string })._kind = kind;
-    return inst;
-  }
-
   private add(kind: string, pos: Vector3, vel: Vector3, life: number, size: number, opts: Partial<Pick<P, "grow" | "grav" | "drag" | "bounce">> & { spin?: number } = {}) {
-    if (this.live.length > 600) return;
-    const mesh = this.get(kind);
+    if (this.live.length > MAX_LIVE) return;
     const s = opts.spin ?? 0;
     this.live.push({
-      mesh, pos: pos.clone(), vel, life, max: life, size, grow: opts.grow ?? 0,
+      kind: this.kinds.get(kind)!, pos: pos.clone(), vel, rot: new Vector3(), life, max: life, size, grow: opts.grow ?? 0,
       spin: new Vector3((Math.random() - 0.5) * s, (Math.random() - 0.5) * s, (Math.random() - 0.5) * s),
       grav: opts.grav ?? 0, drag: opts.drag ?? 0, bounce: opts.bounce ?? false,
     });
-    mesh.position.copyFrom(pos);
-    mesh.scaling.setAll(size);
   }
 
   burst(kind: FxKind, x: number, y: number, dx = 0, dy = 0, n?: number) {
@@ -166,38 +173,65 @@ export class Particles {
   }
 
   clear() {
-    for (const p of this.live) this.release(p);
-    this.live = [];
-  }
-
-  private release(p: P) {
-    p.mesh.setEnabled(false);
-    const kind = (p.mesh as InstancedMesh & { _kind?: string })._kind!;
-    this.kinds.get(kind)!.pool.push(p.mesh);
+    this.live.length = 0;
+    this.flush();
   }
 
   update(dt: number) {
-    const keep: P[] = [];
-    for (const p of this.live) {
+    for (const k of this.kindList) k.count = 0;
+    let n = 0;
+    const live = this.live;
+    for (let i = 0; i < live.length; i++) {
+      const p = live[i];
       p.life -= dt;
-      if (p.life <= 0) { this.release(p); continue; }
+      if (p.life <= 0) continue;
       p.vel.y -= p.grav * dt;
       if (p.drag) p.vel.scaleInPlace(Math.max(0, 1 - p.drag * dt));
-      p.pos.addInPlace(p.vel.scale(dt));
+      p.pos.addInPlaceFromFloats(p.vel.x * dt, p.vel.y * dt, p.vel.z * dt);
       if (p.pos.y < 0.02) {
         p.pos.y = 0.02;
         if (p.bounce) { p.vel.y = Math.abs(p.vel.y) * 0.3; p.vel.x *= 0.6; p.vel.z *= 0.6; }
         else p.vel.y = 0;
       }
       const t = p.life / p.max;
-      const s = (p.size + p.grow * (1 - t)) * Math.min(1, t * 3);
-      p.mesh.position.copyFrom(p.pos);
-      p.mesh.scaling.setAll(Math.max(0.001, s));
-      p.mesh.rotation.x += p.spin.x * dt;
-      p.mesh.rotation.y += p.spin.y * dt;
-      p.mesh.rotation.z += p.spin.z * dt;
-      keep.push(p);
+      const s = Math.max(0.001, (p.size + p.grow * (1 - t)) * Math.min(1, t * 3));
+      p.rot.x += p.spin.x * dt;
+      p.rot.y += p.spin.y * dt;
+      p.rot.z += p.spin.z * dt;
+      this.write(p.kind, p.pos, p.rot, s);
+      live[n++] = p;
     }
-    this.live = keep;
+    live.length = n;
+    this.flush();
+  }
+
+  /** Appends one instance matrix (TRS, same Euler order as Mesh.rotation) to a kind's buffer. */
+  private write(k: KindDef, pos: Vector3, rot: Vector3, s: number) {
+    if ((k.count + 1) * 16 > k.buf.length) {
+      const grown = new Float32Array(k.buf.length * 2);
+      grown.set(k.buf);
+      k.buf = grown;
+      k.master.thinInstanceSetBuffer("matrix", k.buf, 16, false);
+    }
+    tmpS.set(s, s, s);
+    Quaternion.RotationYawPitchRollToRef(rot.y, rot.x, rot.z, tmpQ);
+    Matrix.ComposeToRef(tmpS, tmpQ, pos, tmpM);
+    tmpM.copyToArray(k.buf, k.count * 16);
+    k.count++;
+  }
+
+  /** Pushes this frame's instance counts/matrices to the GPU. */
+  private flush() {
+    for (const k of this.kindList) {
+      const m = k.master;
+      if (k.count > 0) {
+        m.thinInstanceCount = k.count;
+        m.thinInstanceBufferUpdated("matrix");
+        m.isVisible = true;
+      } else if (m.isVisible) {
+        m.isVisible = false;
+        m.thinInstanceCount = 0;
+      }
+    }
   }
 }

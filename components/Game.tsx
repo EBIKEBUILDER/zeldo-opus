@@ -7,6 +7,7 @@ import { input } from "@/game/input";
 import { startRunner } from "@/game/runner";
 import type { Runner } from "@/game/runner";
 import { useGame } from "@/game/store";
+import FpsCounter from "./FpsCounter";
 import HUD from "./HUD";
 import PauseMenu from "./PauseMenu";
 import Screens from "./Screens";
@@ -119,6 +120,7 @@ export default function Game() {
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
       {showTouch && <TouchControls pick={(x, y) => runner.current?.pick(x, y) ?? null} />}
       <HUD />
+      {ready && phase === "playing" && <FpsCounter runner={runner} touch={touch} />}
       <Screens />
       <PauseMenu />
     </div>
