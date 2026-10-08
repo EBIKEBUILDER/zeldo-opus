@@ -132,7 +132,7 @@ function makePlayer(): Player {
 export function createWorld(seed = 0x5eed): World {
   const w: World = {
     tick: 0, time: 0, rng: seed, nextId: 1, player: makePlayer(), enemies: [], breakables: [],
-    pickups: [], jellies: [], puddles: [], jellyHint: false, rupees: 0,
+    pickups: [], jellies: [], puddles: [], jellyHint: false, rupees: 0, kills: 0,
     quest: {
       hasKey: false, keyTaken: false, gateOpen: false, bossShut: false, bossAwake: false,
       bossDead: false, chestOpen: false, enteredDungeon: false,
@@ -365,6 +365,7 @@ function killEnemy(w: World, e: Enemy) {
   e.alive = false;
   e.state = "dead";
   e.vx = e.vy = 0;
+  w.kills++;
   if (e.kind === "king") {
     w.quest.bossDead = true;
     w.quest.bossShut = false;
@@ -641,6 +642,23 @@ function buildNav(w: World, map: MapId): Nav {
         if (dist(tx + 0.5, ty + 0.5, SAFE_ZONE.x, SAFE_ZONE.y) < R) solid[ty * m.w + tx] = 1;
       }
     }
+  }
+  return { w: m.w, h: m.h, solid };
+}
+
+/**
+ * Where the *hero* can walk right now (doors and stairs are open, the spawn
+ * sanctuary is not blocked). Used by the touch controls' tap-to-move routing.
+ */
+export function heroNav(w: World, map: MapId): Nav {
+  const m = MAPS[map];
+  const solid = new Uint8Array(m.w * m.h);
+  for (let ty = 0; ty < m.h; ty++) {
+    for (let tx = 0; tx < m.w; tx++) if (solidFor(w, map, tx, ty, false)) solid[ty * m.w + tx] = 1;
+  }
+  for (const c of propCircles(w, map)) {
+    const tx = Math.floor(c.x), ty = Math.floor(c.y);
+    if (tx >= 0 && ty >= 0 && tx < m.w && ty < m.h) solid[ty * m.w + tx] = 1;
   }
   return { w: m.w, h: m.h, solid };
 }

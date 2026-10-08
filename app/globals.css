@@ -14,6 +14,16 @@ body {
   font-family: var(--font-game);
   -webkit-font-smoothing: antialiased;
   user-select: none;
+  -webkit-user-select: none;
+  /* Mobile: no rubber-band scrolling, no long-press callouts, no tap flashes. */
+  overscroll-behavior: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none;
+}
+
+button {
+  touch-action: manipulation;
 }
 
 canvas {
@@ -77,4 +87,20 @@ canvas {
 }
 .animate-heartbeat {
   animation: heartbeat 0.9s ease-in-out infinite;
+}
+
+@keyframes ripple {
+  0% { opacity: 1; transform: scale(0.3); }
+  100% { opacity: 0; transform: scale(1.25); }
+}
+.animate-ripple {
+  animation: ripple 0.45s ease-out forwards;
+}
+
+@keyframes questflash {
+  0% { box-shadow: 0 0 0 0 rgba(255, 215, 122, 0.9); transform: scale(1.08); }
+  100% { box-shadow: 0 0 0 14px rgba(255, 215, 122, 0); transform: scale(1); }
+}
+.animate-questflash {
+  animation: questflash 0.9s ease-out;
 }

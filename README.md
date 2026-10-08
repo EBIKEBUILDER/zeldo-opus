@@ -18,12 +18,21 @@ Stop the server, run `rm -rf .next`, and start it again.
 
 ## Controls
 
-| Action | Keys |
-| --- | --- |
-| Move (8-way) | WASD / arrow keys |
-| Sword / interact | Space or left click |
-| Start / retry | Enter or click |
-| Mute | M |
+| Action | Keyboard / mouse | Touch (phones & tablets) |
+| --- | --- | --- |
+| Move | WASD / arrow keys | Drag anywhere: a floating analog stick appears under your thumb |
+| Walk to a spot | n/a | Tap the ground (routes around obstacles) |
+| Attack a monster | Space or left click | Tap the monster (locks on and swings), or the ⚔ button |
+| Cut grass / smash a pot | Space or left click | Tap it |
+| Read a sign / open the chest | Space facing it | Tap it, or the ⚔ button (shows *Read* / *Open*) |
+| Swing while steering | n/a | Tap with a second finger |
+| Adventure log (map, quest, items) | Esc or P | ☰ button |
+| World map | Tab | Tap the minimap |
+| Start / retry | Enter or click | Tap |
+| Mute | M | In the adventure log |
+
+Touch controls appear automatically on touch screens. The game pauses itself when you
+switch apps, and phones that support it rumble when Zeldo gets hurt.
 
 ## The quest (spoilers)
 
@@ -49,6 +58,12 @@ sword swing as the glob comes down to bat it straight back at his crown.
 - `game/audio.ts`: Web Audio synthesized SFX and a small music sequencer. No audio files.
 - `game/maps.ts`: ASCII tile maps for the 3×2 screen overworld (16×12 tiles per screen)
   and the 2-room dungeon.
-- `components/*`: React UI only (HUD, title, game over and victory screens).
+- `game/autopilot.ts`: tap-to-move "virtual gamepad". It turns a tapped target into
+  ordinary input frames along an A* route, so the simulation never knows the difference.
+- `game/objective.ts`: turns quest flags into RPG objectives and minimap waypoints.
+- `components/*`: React UI only: the HUD (portrait, hearts, minimap, quest tracker,
+  dialog box), touch controls, the adventure-log pause menu, and the title, game over
+  and victory screens.
 
-Add `?debug` to the URL to expose `window.__zeldo = { store, input }` for testing.
+Add `?debug` to the URL to expose `window.__zeldo = { store, input, runner, autopilot }`
+for testing.

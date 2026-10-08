@@ -87,6 +87,8 @@ class Synth {
   private timer: ReturnType<typeof setInterval> | null = null;
 
   /** Must be called from a user gesture. */
+  private primed = false;
+
   unlock() {
     if (typeof window === "undefined") return;
     if (!this.ctx) {
@@ -114,7 +116,16 @@ class Synth {
       this.noise = buf;
       this.timer = setInterval(() => this.schedule(), 60);
     }
-    if (this.ctx.state === "suspended") void this.ctx.resume();
+    // iOS: resume (also after an "interrupted" phone call / app switch) and play
+    // one silent sample inside the gesture so the context is truly unlocked.
+    if (this.ctx.state !== "running") void this.ctx.resume();
+    if (!this.primed) {
+      this.primed = true;
+      const src = this.ctx.createBufferSource();
+      src.buffer = this.ctx.createBuffer(1, 1, 22050);
+      src.connect(this.ctx.destination);
+      src.start(0);
+    }
   }
 
   setMuted(m: boolean) {
@@ -134,6 +145,7 @@ class Synth {
     this.timer = null;
     void this.ctx?.close();
     this.ctx = null;
+    this.primed = false;
   }
 
   // ── Music ──

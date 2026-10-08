@@ -1,9 +1,11 @@
-// Keyboard/mouse → InputFrame. Held keys give the movement vector; attack is an
-// edge-triggered press that is consumed by the next simulation step.
+// Keyboard/mouse/touch → InputFrame. Held keys (or the virtual stick) give the
+// movement vector; attack is an edge-triggered press consumed by the next step.
 import type { InputFrame } from "./types";
 
 const held = new Set<string>();
 let attackPending = false;
+/** Virtual joystick vector (touch), magnitude 0..1. */
+let stickX = 0, stickY = 0;
 
 const MOVE_KEYS: Record<string, [number, number]> = {
   KeyW: [0, -1], ArrowUp: [0, -1],
@@ -23,12 +25,22 @@ export const input = {
   click() {
     attackPending = true;
   },
+  setStick(x: number, y: number) {
+    stickX = x; stickY = y;
+  },
   clear() {
     held.clear();
     attackPending = false;
+    stickX = stickY = 0;
   },
   isMoveKey(code: string) {
     return code in MOVE_KEYS || code === "Space";
+  },
+  /** True while the player is steering by hand (keys or stick). */
+  steering(): boolean {
+    if (stickX !== 0 || stickY !== 0) return true;
+    for (const code of held) if (MOVE_KEYS[code]) return true;
+    return false;
   },
   /** Builds the input for one simulation step (consumes the attack press). */
   frame(): InputFrame {
@@ -39,6 +51,7 @@ export const input = {
     }
     mx = Math.max(-1, Math.min(1, mx));
     my = Math.max(-1, Math.min(1, my));
+    if (mx === 0 && my === 0) { mx = stickX; my = stickY; }
     const attack = attackPending;
     attackPending = false;
     return { mx, my, attack };

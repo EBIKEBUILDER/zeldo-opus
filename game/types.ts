@@ -202,6 +202,8 @@ export interface World {
   jellyHint: boolean;
   quest: Quest;
   rupees: number;
+  /** Monsters defeated this run (adventure-log stat). */
+  kills: number;
   /** Screen shake amplitude, red damage flash, global hit-stop. */
   fx: { shake: number; hurt: number; hitstop: number; freeze: number };
   message: Message | null;

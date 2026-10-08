@@ -2,6 +2,7 @@
 // draining its events into audio + particles, then letting the view draw an
 // interpolated frame. This is the only place sim, store, audio and view meet.
 import { audio } from "./audio";
+import { autopilot } from "./autopilot";
 import { input } from "./input";
 import { DT, step } from "./sim";
 import { useGame } from "./store";
@@ -10,8 +11,15 @@ import { GameView } from "./render/view";
 
 const MAX_STEPS = 6;
 
-export function startRunner(canvas: HTMLCanvasElement): () => void {
+export interface Runner {
+  stop(): void;
+  /** Screen (CSS px, relative to the canvas) → tapped ground point + monster under the finger. */
+  pick(px: number, py: number): { x: number; y: number; enemyId: number | null } | null;
+}
+
+export function startRunner(canvas: HTMLCanvasElement): Runner {
   const view = new GameView(canvas);
+  let lastHp = -1;
   let acc = 0;
   let last = performance.now();
 
@@ -31,11 +39,18 @@ export function startRunner(canvas: HTMLCanvasElement): () => void {
 
     const store = useGame.getState();
     const w = store.world;
-    if (store.phase === "playing") {
+    if (store.phase === "playing" && !store.paused) {
       acc += frame;
       let n = 0;
       while (acc >= DT && n < MAX_STEPS) {
-        step(w, input.frame());
+        // Hand steering always wins over tap-to-move.
+        let f = input.frame();
+        if (input.steering()) autopilot.cancel();
+        else if (autopilot.active) {
+          const a = autopilot.frame(w, DT);
+          if (a) f = { mx: a.mx, my: a.my, attack: a.attack || f.attack };
+        }
+        step(w, f);
         drain(w);
         acc -= DT;
         n++;
@@ -44,8 +59,16 @@ export function startRunner(canvas: HTMLCanvasElement): () => void {
     } else {
       acc = 0;
       drain(w);
+      if (store.phase !== "playing") autopilot.cancel();
     }
     store.sync();
+
+    // A little rumble when the hero gets hurt (phones that support it).
+    const hp = w.player.hp;
+    if (lastHp >= 0 && hp < lastHp && store.touch && typeof navigator.vibrate === "function") {
+      try { navigator.vibrate(hp <= 0 ? [60, 40, 90] : 45); } catch { /* not allowed */ }
+    }
+    lastHp = hp;
 
     // Music follows the mood.
     const s = useGame.getState();
@@ -58,15 +81,26 @@ export function startRunner(canvas: HTMLCanvasElement): () => void {
     } else if (s.phase === "title") track = "over";
     audio.setTrack(track);
 
-    view.render(s.world, acc / DT, frame, s.phase);
+    view.render(s.world, acc / DT, s.paused ? 0 : frame, s.phase, autopilot.marker(s.world));
   });
 
   const onResize = () => view.resize();
   window.addEventListener("resize", onResize);
+  // Phones: switching apps or locking the screen pauses the adventure.
+  const onVis = () => {
+    if (document.hidden) { input.clear(); useGame.getState().setPaused(true); }
+  };
+  document.addEventListener("visibilitychange", onVis);
 
-  return () => {
-    window.removeEventListener("resize", onResize);
-    view.engine.stopRenderLoop();
-    view.dispose();
+  return {
+    stop() {
+      window.removeEventListener("resize", onResize);
+      document.removeEventListener("visibilitychange", onVis);
+      view.engine.stopRenderLoop();
+      view.dispose();
+    },
+    pick(px, py) {
+      return view.pick(px, py, useGame.getState().world);
+    },
   };
 }

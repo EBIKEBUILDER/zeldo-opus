@@ -2,13 +2,23 @@
 import { create } from "zustand";
 import { createWorld, retryWorld, transitionFade } from "./sim";
 import { areaName } from "./maps";
+import { objective, regionKey } from "./objective";
 import type { Phase, World } from "./types";
+
+export type MenuTab = "map" | "quest" | "items";
 
 export interface GameStore {
   phase: Phase;
   world: World;
   muted: boolean;
   runId: number;
+  /** Pause menu open (the simulation is frozen). */
+  paused: boolean;
+  menuTab: MenuTab;
+  /** Touch controls are showing (coarse pointer or a touch was seen). */
+  touch: boolean;
+  /** Overworld screens / dungeon rooms the hero has set foot in (fog of war). */
+  visited: Record<string, true>;
 
   // Derived HUD snapshot (primitives so selectors stay cheap).
   hp: number;
@@ -24,6 +34,9 @@ export interface GameStore {
   msgText: string;
   msgBig: boolean;
   prompt: string | null;
+  objStep: number;
+  objTitle: string;
+  objHint: string;
   /** Per-frame values (read via subscribe for direct DOM updates). */
   hurt: number;
   fade: number;
@@ -35,6 +48,9 @@ export interface GameStore {
   retry(): void;
   toTitle(): void;
   toggleMute(): void;
+  setPaused(paused: boolean, tab?: MenuTab): void;
+  setMenuTab(tab: MenuTab): void;
+  setTouch(touch: boolean): void;
   sync(): void;
 }
 
@@ -42,6 +58,7 @@ function derive(w: World, phase: Phase) {
   const p = w.player;
   const king = w.enemies.find((e) => e.kind === "king")!;
   const m = w.message;
+  const obj = objective(w);
   return {
     hp: p.hp,
     maxHp: p.maxHp,
@@ -56,6 +73,9 @@ function derive(w: World, phase: Phase) {
     msgText: m ? m.text : "",
     msgBig: m ? m.big : false,
     prompt: w.prompt,
+    objStep: obj.step,
+    objTitle: obj.title,
+    objHint: obj.hint,
     hurt: w.fx.hurt,
     fade: transitionFade(w),
     lowHp: p.hp > 0 && p.hp <= 2,
@@ -69,25 +89,39 @@ export const useGame = create<GameStore>((set, get) => {
     world,
     muted: false,
     runId: 0,
+    paused: false,
+    menuTab: "map",
+    touch: false,
+    visited: {},
     ...derive(world, "title"),
     finalTime: 0,
     finalRupees: 0,
 
     start() {
       const w = createWorld();
-      set({ world: w, phase: "playing", runId: get().runId + 1, ...derive(w, "playing") });
+      set({ world: w, phase: "playing", runId: get().runId + 1, paused: false, visited: {}, ...derive(w, "playing") });
     },
     retry() {
       const w = get().world;
       retryWorld(w);
-      set({ phase: "playing", ...derive(w, "playing") });
+      set({ phase: "playing", paused: false, ...derive(w, "playing") });
     },
     toTitle() {
       const w = createWorld();
-      set({ world: w, phase: "title", runId: get().runId + 1, ...derive(w, "title") });
+      set({ world: w, phase: "title", runId: get().runId + 1, paused: false, visited: {}, ...derive(w, "title") });
     },
     toggleMute() {
       set({ muted: !get().muted });
+    },
+    setPaused(paused, tab) {
+      if (paused && get().phase !== "playing") return;
+      set(tab ? { paused, menuTab: tab } : { paused });
+    },
+    setMenuTab(tab) {
+      set({ menuTab: tab });
+    },
+    setTouch(touch) {
+      if (get().touch !== touch) set({ touch });
     },
     sync() {
       const s = get();
@@ -109,6 +143,11 @@ export const useGame = create<GameStore>((set, get) => {
           (patch as Record<string, unknown>)[key] = d[key];
           dirty = true;
         }
+      }
+      // Fog of war: remember every screen/room the hero has explored.
+      if (s.phase === "playing" && !w.transition) {
+        const key = regionKey(w.player.map, w.player.x, w.player.y);
+        if (!s.visited[key]) { patch.visited = { ...s.visited, [key]: true }; dirty = true; }
       }
       if (dirty) set(patch);
     },

@@ -3,9 +3,10 @@
 //  World (plain data) and poses meshes, lights and the camera to match.
 // ─────────────────────────────────────────────────────────────────────────────
 import {
-  Color3, Color4, DirectionalLight, Engine, FreeCamera, GlowLayer, HemisphericLight, InstancedMesh, Mesh,
+  Color3, Color4, DirectionalLight, Engine, FreeCamera, GlowLayer, HemisphericLight, InstancedMesh, Matrix, Mesh,
   MeshBuilder, PointLight, Scene, ShadowGenerator, StandardMaterial, TransformNode, Vector3, VertexBuffer, VertexData,
 } from "@babylonjs/core";
+import type { Marker } from "../autopilot";
 import type { MapId } from "../maps";
 import { HERO_SPAWN } from "../maps";
 import type { Enemy, GameEvent, Phase, World } from "../types";
@@ -20,6 +21,10 @@ import { hex, makeMat, toB, yawOf } from "./util";
 
 const CAM_HEIGHT = 10.6;
 const CAM_BACK = 7.4;
+const CAM_DIST = Math.hypot(CAM_HEIGHT, CAM_BACK);
+const BASE_FOV = 0.72;
+/** Narrow (portrait) screens still see at least twice this many tiles across. */
+const MIN_HALF_WIDTH = 5.0;
 const TRAIL_SEGS = 14;
 
 interface EnemyView {
@@ -81,6 +86,13 @@ export class GameView {
   private shadowMaster: Mesh;
   private ringMaster: Mesh;
   private fillMaster: Mesh;
+  private moveRing: Mesh;
+  private lockRing: Mesh;
+  private markerSerial = -1;
+  private markerT = 0;
+  /** Camera pull-back for narrow screens, and the visible half-width in tiles. */
+  private zoom = 1;
+  private halfW = 8.65;
 
   private boundWorld: World | null = null;
   private enemyViews = new Map<number, EnemyView>();
@@ -103,7 +115,9 @@ export class GameView {
 
   constructor(canvas: HTMLCanvasElement) {
     const engine = new Engine(canvas, true, { stencil: true, antialias: true, preserveDrawingBuffer: false }, true);
-    engine.setHardwareScalingLevel(1 / Math.min(2, window.devicePixelRatio || 1));
+    // Phones: cap the render resolution a little lower to keep a steady frame rate.
+    const mobile = window.matchMedia?.("(pointer: coarse)").matches ?? false;
+    engine.setHardwareScalingLevel(1 / Math.min(mobile ? 1.5 : 2, window.devicePixelRatio || 1));
     this.engine = engine;
     const scene = new Scene(engine);
     this.scene = scene;
@@ -125,7 +139,7 @@ export class GameView {
     this.sun.shadowMinZ = 1;
     this.sun.shadowMaxZ = 90;
 
-    const sg = new ShadowGenerator(2048, this.sun);
+    const sg = new ShadowGenerator(mobile ? 1024 : 2048, this.sun);
     sg.usePercentageCloserFiltering = true;
     sg.filteringQuality = ShadowGenerator.QUALITY_MEDIUM;
     sg.bias = 0.0015;
@@ -228,10 +242,74 @@ export class GameView {
       m.isVisible = false;
       m.isPickable = false;
     }
+
+    // Tap-to-move markers: a soft cream ring for "walk here", a spinning red
+    // lock-on reticle (ring + four inward chevrons) for "attack that".
+    this.moveRing = MeshBuilder.CreateTorus("moveRing", { diameter: 2, thickness: 0.11, tessellation: 36 }, scene);
+    this.moveRing.scaling.y = 0.35;
+    this.moveRing.bakeCurrentTransformIntoVertices();
+    this.moveRing.material = makeMat(scene, "moveRingMat", hex("#fff3c4"), { emissive: hex("#ffe08a"), unlit: true });
+    const lr = MeshBuilder.CreateTorus("lockTorus", { diameter: 2, thickness: 0.08, tessellation: 36 }, scene);
+    lr.scaling.y = 0.35;
+    lr.bakeCurrentTransformIntoVertices();
+    const parts: Mesh[] = [lr];
+    for (let i = 0; i < 4; i++) {
+      const a = (i * Math.PI) / 2;
+      const c = MeshBuilder.CreateCylinder("lockChev", { height: 0.05, diameterTop: 0.34, diameterBottom: 0.34, tessellation: 3 }, scene);
+      c.scaling.set(0.9, 1, 1.25);
+      c.rotation.y = -a + Math.PI / 2;
+      c.position.set(Math.cos(a) * 1.28, 0, Math.sin(a) * 1.28);
+      c.bakeCurrentTransformIntoVertices();
+      parts.push(c);
+    }
+    this.lockRing = Mesh.MergeMeshes(parts, true, true)!;
+    this.lockRing.name = "lockRing";
+    this.lockRing.material = makeMat(scene, "lockRingMat", hex("#ff5a6a"), { emissive: hex("#ff2d48"), unlit: true });
+    for (const m of [this.moveRing, this.lockRing]) { m.isVisible = false; m.isPickable = false; }
+    this.resize();
   }
 
   resize() {
     this.engine.resize();
+    // Portrait phones: widen the lens a touch and pull the camera back so the
+    // hero still sees ~10 tiles across instead of a narrow keyhole.
+    const wpx = this.engine.getRenderWidth(), hpx = this.engine.getRenderHeight();
+    const aspect = hpx > 0 ? wpx / hpx : 16 / 9;
+    const fov = aspect < 1 ? Math.min(0.95, BASE_FOV + (1 - aspect) * 0.35) : BASE_FOV;
+    this.camera.fov = fov;
+    const half0 = CAM_DIST * Math.tan(fov / 2) * aspect;
+    this.zoom = Math.max(1, MIN_HALF_WIDTH / half0);
+    this.halfW = half0 * this.zoom;
+  }
+
+  /**
+   * Touch picking: screen point (CSS px relative to the canvas) → the ground
+   * point under it, plus the monster under the finger (generous, screen-space).
+   */
+  pick(px: number, py: number, w: World): { x: number; y: number; enemyId: number | null } | null {
+    const ray = this.scene.createPickingRay(px, py, Matrix.Identity(), this.camera);
+    if (Math.abs(ray.direction.y) < 1e-4) return null;
+    const t = -ray.origin.y / ray.direction.y;
+    if (t < 0) return null;
+    const gx = ray.origin.x + ray.direction.x * t;
+    const gz = ray.origin.z + ray.direction.z * t;
+    const canvas = this.engine.getRenderingCanvas();
+    const cw = canvas?.clientWidth ?? 1, ch = canvas?.clientHeight ?? 1;
+    const vp = this.camera.viewport.toGlobal(cw, ch);
+    const tm = this.scene.getTransformMatrix();
+    let enemyId: number | null = null;
+    let bestD = Infinity;
+    for (const e of w.enemies) {
+      if (!e.alive || e.map !== w.player.map) continue;
+      const king = e.kind === "king";
+      const allow = king ? 78 : 46;
+      for (const h of king ? [0.4, 1.3] : [0.25, 0.6]) {
+        const s = Vector3.Project(new Vector3(e.x, h, -e.y), Matrix.Identity(), tm, vp);
+        const d = Math.hypot(s.x - px, s.y - py);
+        if (d < allow && d < bestD) { bestD = d; enemyId = e.id; }
+      }
+    }
+    return { x: gx, y: -gz, enemyId };
   }
 
   dispose() {
@@ -334,8 +412,13 @@ export class GameView {
 
   private cameraGoal(w: World): Vector3 {
     const p = w.player;
-    if (p.map === "over") return new Vector3(clamp(p.x, 9.5, 38.5), 0, clamp(p.y, 4.6, 20.2));
-    return new Vector3(8, 0, clamp(p.y, 5.2, 18.2));
+    // Keep the map edges just off-screen; narrow screens follow the hero sideways.
+    const follow = (x: number, mapW: number) => {
+      const lo = this.halfW + 0.85, hi = mapW - this.halfW - 0.85;
+      return lo >= hi ? mapW / 2 : clamp(x, lo, hi);
+    };
+    if (p.map === "over") return new Vector3(follow(p.x, 48), 0, clamp(p.y, 4.6, 20.2));
+    return new Vector3(follow(p.x, 16), 0, clamp(p.y, 5.2, 18.2));
   }
 
   // ── Events from the simulation ──
@@ -346,7 +429,7 @@ export class GameView {
   }
 
   // ── Frame ──
-  render(w: World, alpha: number, dt: number, phase: Phase) {
+  render(w: World, alpha: number, dt: number, phase: Phase, marker: Marker | null = null) {
     this.time += dt;
     const t = this.time;
     if (w !== this.boundWorld) this.bindWorld(w);
@@ -364,7 +447,8 @@ export class GameView {
     const sh = w.fx.shake * w.fx.shake * 0.42;
     const sx = (Math.sin(t * 57.3) + Math.sin(t * 91.7)) * 0.5 * sh;
     const sz = (Math.sin(t * 63.1 + 1.3) + Math.sin(t * 79.9)) * 0.5 * sh;
-    this.camera.position.set(this.camTarget.x + sx, CAM_HEIGHT + sz * 0.5, -this.camTarget.z - CAM_BACK + sz);
+    const z = this.zoom;
+    this.camera.position.set(this.camTarget.x + sx, CAM_HEIGHT * z + sz * 0.5, -this.camTarget.z - CAM_BACK * z + sz);
     this.camera.setTarget(new Vector3(this.camTarget.x + sx * 0.6, 0.6, -this.camTarget.z + sz * 0.6));
 
     // Sun & shadows follow the view
@@ -376,6 +460,7 @@ export class GameView {
     this.poseBreakables(w);
     this.posePickups(w, alpha);
     this.poseJellies(w, alpha, dt);
+    this.poseMarker(marker, w, alpha, dt);
     this.poseWorldProps(w, dt);
     // Shared emitter clock (~14 Hz) for trails and dazed stars.
     this.fxT = this.fxT <= 0 ? 0.07 : this.fxT - dt;
@@ -571,6 +656,35 @@ export class GameView {
     });
     for (const [id, v] of this.enemyViews) {
       if (!live.has(id)) { v.root.dispose(false, false); this.enemyViews.delete(id); }
+    }
+  }
+
+  // ── Tap-to-move marker ──
+  private poseMarker(m: Marker | null, w: World, alpha: number, dt: number) {
+    const show = !!m && m.map === this.currentMap;
+    this.moveRing.isVisible = show && !m!.hostile;
+    this.lockRing.isVisible = show && m!.hostile;
+    if (!show || !m) return;
+    if (m.serial !== this.markerSerial) { this.markerSerial = m.serial; this.markerT = 0; }
+    this.markerT += dt;
+    const t = this.time;
+    const k = Math.min(1, this.markerT / 0.22);
+    const pop = 1 + (1 - k) * (1 - k) * 0.9;
+    let x = m.x, y = m.y;
+    if (m.hostile) {
+      // Follow the monster smoothly (interpolated like its mesh).
+      const e = w.enemies.find((q) => q.id === m.enemyId);
+      if (e) { x = lerp(e.px, e.x, alpha); y = lerp(e.py, e.y, alpha); }
+      const s = m.r * pop * (1 + Math.sin(t * 9) * 0.06);
+      this.lockRing.position.set(x, 0.08, -y);
+      this.lockRing.scaling.set(s, 1, s);
+      this.lockRing.rotation.y = t * 2.4;
+      this.lockRing.visibility = 0.65 + 0.35 * k;
+    } else {
+      const s = m.r * pop * (1 + Math.sin(t * 6) * 0.08);
+      this.moveRing.position.set(x, 0.07, -y);
+      this.moveRing.scaling.set(s, 1, s);
+      this.moveRing.visibility = 0.55 + 0.35 * Math.abs(Math.sin(t * 4));
     }
   }
 
