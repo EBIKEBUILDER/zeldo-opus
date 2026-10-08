@@ -121,11 +121,25 @@ export class GameView {
   private gooT = 0;
 
   /** Live render stats for the on-screen FPS counter (refreshed ~2×/s). */
-  readonly stats = { fps: 0, frameMs: 0, cpuMs: 0, drawCalls: 0, activeMeshes: 0, renderScale: 1 };
+  readonly stats = {
+    fps: 0,
+    frameMs: 0,
+    cpuMs: 0,
+    drawCalls: 0,
+    activeMeshes: 0,
+    totalMeshes: 0,
+    triangles: 0,
+    particles: 0,
+    renderScale: 1,
+    resolution: "",
+    memMb: 0,
+    maxGapMs: 0,
+  };
   private statFrames = 0;
   private statT0 = 0;
   private statCpu = 0;
   private statDraws = 0;
+  private statTriangles = 0;
   private statLast = 0;
   private statMaxGap = 0;
   /** Render pixels per CSS pixel (adaptive: steps down on high-DPI screens that can't keep up). */
@@ -139,6 +153,7 @@ export class GameView {
     this.renderScale = Math.min(mobile ? 1.5 : 2, window.devicePixelRatio || 1);
     engine.setHardwareScalingLevel(1 / this.renderScale);
     this.stats.renderScale = this.renderScale;
+    this.stats.resolution = `${engine.getRenderWidth()}×${engine.getRenderHeight()}`;
     this.engine = engine;
     const scene = new Scene(engine, { useGeometryUniqueIdsMap: true, useMaterialMeshMap: true, useClonedMeshMap: true });
     this.scene = scene;
@@ -312,6 +327,7 @@ export class GameView {
     // Portrait phones: widen the lens a touch and pull the camera back so the
     // hero still sees ~10 tiles across instead of a narrow keyhole.
     const wpx = this.engine.getRenderWidth(), hpx = this.engine.getRenderHeight();
+    this.stats.resolution = `${wpx}×${hpx}`;
     const aspect = hpx > 0 ? wpx / hpx : 16 / 9;
     const fov = aspect < 1 ? Math.min(0.95, BASE_FOV + (1 - aspect) * 0.35) : BASE_FOV;
     this.camera.fov = fov;
@@ -512,15 +528,17 @@ export class GameView {
     const dc = (this.engine as unknown as { _drawCalls: { fetchNewFrame(): void; current: number } })._drawCalls;
     dc.fetchNewFrame();
     this.scene.render();
-    this.trackStats(t0, dc.current);
+    const activeIndices = this.scene.getActiveIndices();
+    this.trackStats(t0, dc.current, Math.round(activeIndices / 3));
   }
 
-  private trackStats(t0: number, draws: number) {
+  private trackStats(t0: number, draws: number, triangles: number) {
     const now = performance.now();
     if (this.statLast) this.statMaxGap = Math.max(this.statMaxGap, now - this.statLast);
     this.statLast = now;
     this.statCpu += now - t0;
     this.statDraws += draws;
+    this.statTriangles += triangles;
     this.statFrames++;
     if (this.statT0 === 0) this.statT0 = now;
     const span = now - this.statT0;
@@ -530,9 +548,17 @@ export class GameView {
       this.stats.frameMs = span / n;
       this.stats.cpuMs = this.statCpu / n;
       this.stats.drawCalls = Math.round(this.statDraws / n);
+      this.stats.triangles = Math.round(this.statTriangles / n);
       this.stats.activeMeshes = this.scene.getActiveMeshes().length;
+      this.stats.totalMeshes = this.scene.meshes.length;
+      this.stats.particles = this.particles.liveCount;
+      this.stats.renderScale = this.renderScale;
+      this.stats.resolution = `${this.engine.getRenderWidth()}×${this.engine.getRenderHeight()}`;
+      this.stats.maxGapMs = this.statMaxGap;
+      const mem = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize;
+      this.stats.memMb = mem ? Math.round(mem / (1024 * 1024)) : 0;
       this.adaptResolution(this.stats.fps, this.statMaxGap);
-      this.statFrames = 0; this.statCpu = 0; this.statDraws = 0; this.statT0 = now; this.statMaxGap = 0;
+      this.statFrames = 0; this.statCpu = 0; this.statDraws = 0; this.statTriangles = 0; this.statT0 = now; this.statMaxGap = 0;
     }
   }
 

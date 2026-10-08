@@ -41,6 +41,11 @@ export class Particles {
   /** Every particle master mesh (for glow-layer inclusion). */
   readonly masters: Mesh[] = [];
 
+  /** Number of currently active particles. */
+  get liveCount(): number {
+    return this.live.length;
+  }
+
   constructor(private scene: Scene) {
     this.root = new TransformNode("fxRoot", scene);
     const mk = (name: string, mesh: Mesh, color: string, emissive?: string, unlit = false) => {
