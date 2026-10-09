@@ -3,7 +3,7 @@
 import {
   Color3, Mesh, MeshBuilder, Scene, StandardMaterial, TransformNode, Vector3, VertexData,
 } from "@babylonjs/core";
-import { colorize, hex, jitter, makeMat, merge, Rng } from "./util";
+import { colorize, hex, jitter, makeMat, merge, mergeSmooth, Rng } from "./util";
 
 export const PAL = {
   trunk: hex("#7a5236"),
@@ -362,31 +362,40 @@ export function hero(scene: Scene, lib: Lib): HeroRig {
 export function gloobMesh(scene: Scene, lib: Lib, king: boolean): Mesh {
   const base = king ? PAL.king : PAL.gloob;
   const light = king ? PAL.kingLight : PAL.gloobLight;
-  const body = MeshBuilder.CreateIcoSphere("gbody", { radius: 0.5, subdivisions: 2 }, scene);
-  jitter(body, 0.025, king ? 2 : 1);
+  // High-resolution smooth sphere: 32 segments for King (scaled 2.5x in game), 24 for gloobs
+  const body = MeshBuilder.CreateSphere("gbody", { diameter: 1.0, segments: king ? 32 : 24 }, scene);
   body.scaling.set(1, 0.78, 1);
   body.position.y = 0.39;
-  colorize(body, (_x, y) => (y > 0.18 ? light : y < -0.25 ? base.scale(0.7) : base));
+  // Soft, smooth vertical color gradient across the body
+  colorize(body, (_x, y) => {
+    if (y > 0) {
+      const t = Math.min(1, y / 0.45);
+      return Color3.Lerp(base, light, t);
+    } else {
+      const t = Math.min(1, -y / 0.45);
+      return Color3.Lerp(base, base.scale(0.7), t);
+    }
+  });
   const parts = [body];
   const eye = (x: number) => {
     // Body surface sits at z≈0.47 at eye height, so eyes must poke out past it.
-    const w = MeshBuilder.CreateIcoSphere("eyeW", { radius: 0.15, subdivisions: 1 }, scene);
+    const w = MeshBuilder.CreateSphere("eyeW", { diameter: 0.3, segments: king ? 20 : 16 }, scene);
     w.position.set(x, 0.54, 0.44);
     w.scaling.z = 0.55;
-    const p = MeshBuilder.CreateIcoSphere("eyeP", { radius: 0.075, subdivisions: 1 }, scene);
+    const p = MeshBuilder.CreateSphere("eyeP", { diameter: 0.15, segments: king ? 20 : 16 }, scene);
     p.position.set(x * 1.04, 0.52, 0.52);
     p.scaling.z = 0.5;
-    const glint = MeshBuilder.CreateIcoSphere("eyeG", { radius: 0.025, subdivisions: 0 }, scene);
+    const glint = MeshBuilder.CreateSphere("eyeG", { diameter: 0.05, segments: 12 }, scene);
     glint.position.set(x * 1.04 - 0.025, 0.55, 0.555);
     parts.push(colorize(w, hex("#ffffff")), colorize(p, hex("#1d1426")), colorize(glint, hex("#ffffff")));
   };
   eye(-0.16); eye(0.16);
-  const shine = MeshBuilder.CreateIcoSphere("shine", { radius: 0.08, subdivisions: 0 }, scene);
+  const shine = MeshBuilder.CreateSphere("shine", { diameter: 0.16, segments: 14 }, scene);
   shine.position.set(-0.2, 0.72, 0.15);
   shine.scaling.set(1, 0.5, 1);
   parts.push(colorize(shine, hex("#f4ecff")));
   if (!king) {
-    const smile = MeshBuilder.CreateTorus("smile", { diameter: 0.16, thickness: 0.03, tessellation: 10 }, scene);
+    const smile = MeshBuilder.CreateTorus("smile", { diameter: 0.16, thickness: 0.03, tessellation: 20 }, scene);
     smile.rotation.x = Math.PI / 2;
     smile.scaling.z = 0.6;
     smile.position.set(0, 0.36, 0.475);
@@ -404,12 +413,12 @@ export function gloobMesh(scene: Scene, lib: Lib, king: boolean): Mesh {
     mouth.position.set(0, 0.36, 0.49);
     parts.push(colorize(mouth, hex("#3a0f2a")));
   }
-  return merge(king ? "kingBody" : "gloobBody", parts, lib.vc, 0.05, king ? 12 : 11);
+  return mergeSmooth(king ? "kingBody" : "gloobBody", parts, lib.vc);
 }
 
 export function crown(scene: Scene, lib: Lib): Mesh {
   const parts: Mesh[] = [];
-  const ring = MeshBuilder.CreateCylinder("ring", { height: 0.14, diameter: 0.42, tessellation: 10 }, scene);
+  const ring = MeshBuilder.CreateCylinder("ring", { height: 0.14, diameter: 0.42, tessellation: 16 }, scene);
   parts.push(colorize(ring, PAL.gold));
   for (let i = 0; i < 5; i++) {
     const a = (i / 5) * Math.PI * 2;
@@ -479,17 +488,24 @@ export function sunstoneMesh(scene: Scene): Mesh {
 
 // ── King's royal jelly ──────────────────────────────────────────────────────
 
-/** A wobbly glob of royal jelly with a little gold fleck suspended inside. */
+/** A smooth glob of royal jelly with a little gold fleck suspended inside. */
 export function jellyBallMesh(scene: Scene, lib: Lib): Mesh {
-  const ball = MeshBuilder.CreateIcoSphere("jball", { radius: 0.3, subdivisions: 1 }, scene);
-  jitter(ball, 0.03, 21);
-  colorize(ball, (_x, y) => (y > 0.1 ? PAL.kingLight : y < -0.15 ? PAL.king.scale(0.75) : PAL.king));
-  const shine = MeshBuilder.CreateIcoSphere("jshine", { radius: 0.07, subdivisions: 0 }, scene);
+  const ball = MeshBuilder.CreateSphere("jball", { diameter: 0.6, segments: 20 }, scene);
+  colorize(ball, (_x, y) => {
+    if (y > 0) {
+      const t = Math.min(1, y / 0.28);
+      return Color3.Lerp(PAL.king, PAL.kingLight, t);
+    } else {
+      const t = Math.min(1, -y / 0.28);
+      return Color3.Lerp(PAL.king, PAL.king.scale(0.75), t);
+    }
+  });
+  const shine = MeshBuilder.CreateSphere("jshine", { diameter: 0.14, segments: 12 }, scene);
   shine.position.set(-0.12, 0.17, -0.1);
   shine.scaling.set(1, 0.55, 1);
   const fleck = MeshBuilder.CreatePolyhedron("jfleck", { type: 1, size: 0.07 }, scene);
   fleck.position.set(0.04, 0.02, 0.05);
-  return merge("jellyBall", [ball, colorize(shine, hex("#ffe6f4")), colorize(fleck, PAL.gold)], lib.vc, 0.04, 22);
+  return mergeSmooth("jellyBall", [ball, colorize(shine, hex("#ffe6f4")), colorize(fleck, PAL.gold)], lib.vc);
 }
 
 /** Flat, blobby puddle (several overlapping discs plus a couple of bubbles). */

@@ -9,7 +9,10 @@ import {
 import type {
   World, Player, Enemy, Breakable, Pickup, PickupKind, InputFrame, SfxName, FxKind, Jelly,
 } from "./types";
-import { type Nav, type NavSize, findPath, lineClear } from "./path";
+import {
+  type Nav, type NavSize, findPath, lineClear, pathScheduler,
+  wallSlideVector, getStandoffPoint, getPortals, chunkToUnified,
+} from "./path";
 
 export const DT = 1 / 60;
 
@@ -107,6 +110,7 @@ function makeEnemy(w: World, kind: "gloob" | "king", map: MapId, x: number, y: n
     contactCd: 0, flash: 0, lastSwing: -1, respawnT: 0, alive: true, ldx: 0, ldy: 1, enraged: false,
     iframes: 0, lunges: 0, minion: false,
     path: [], pathI: 0, repathT: 0, pgx: x, pgy: y, pathOk: true,
+    pathPending: false, wallStuckT: 0,
     stuckT: 0, ax: x, ay: y, anchorT: 0, calmT: 0, alertT: 0,
     rangedCd: 0, unreachT: 0,
   };
@@ -116,8 +120,10 @@ function makeEnemy(w: World, kind: "gloob" | "king", map: MapId, x: number, y: n
 /** Forget any route / pursuit state (used on respawn and retry). */
 function resetAi(e: Enemy) {
   e.path = []; e.pathI = 0; e.repathT = 0; e.pathOk = true;
+  e.pathPending = false; e.wallStuckT = 0;
   e.stuckT = 0; e.ax = e.x; e.ay = e.y; e.anchorT = 0; e.calmT = 0; e.alertT = 0;
   e.rangedCd = 0; e.unreachT = 0;
+  pathScheduler.cancel(e.id);
 }
 
 function makePlayer(): Player {
@@ -140,7 +146,7 @@ export function createWorld(seed = 0x5eed): World {
     fx: { shake: 0, hurt: 0, hitstop: 0, freeze: 0 },
     message: null, transition: null,
     checkpoint: { map: "over", x: HERO_SPAWN.x, y: HERO_SPAWN.y, face: Math.PI / 2 },
-    victoryT: 0, outcome: null, prompt: null, events: [],
+    victoryT: 0, outcome: null, prompt: null, navRevision: 1, events: [],
   };
   for (const id of ["over", "dungeon"] as MapId[]) {
     const m = MAPS[id];
@@ -176,6 +182,7 @@ export function retryWorld(w: World) {
   w.quest.bossAwake = false;
   w.fx = { shake: 0, hurt: 0, hitstop: 0, freeze: 0 };
   w.message = null; w.transition = null; w.outcome = null; w.victoryT = 0; w.events = [];
+  invalidateNav(w);
 }
 
 function spawnPickup(w: World, kind: PickupKind, map: MapId, x: number, y: number, permanent: boolean, pop = true) {
@@ -204,8 +211,16 @@ function gateClosed(w: World) {
 function solidFor(w: World, map: MapId, tx: number, ty: number, enemy: boolean): boolean {
   const ch = tileAt(map, tx, ty);
   if (isStaticSolid(ch)) return true;
-  if (ch === "G") return enemy || gateClosed(w);
-  if (enemy && (ch === "D" || ch === "X")) return true;
+  if (ch === "G") return gateClosed(w);
+  if (ch === "D" || ch === "X") {
+    if (!enemy) return false;
+    // For enemy: check if portal at this tile is traversable by AI
+    const portals = getPortals();
+    return !portals.some((p) => {
+      const from = chunkToUnified(p.fromChunk, p.fromTile.x, p.fromTile.y);
+      return from.map === map && from.x === tx && from.y === ty && p.traversableByAI;
+    });
+  }
   return false;
 }
 
@@ -270,12 +285,14 @@ function moveBody(
 ): boolean {
   // Axis-separated moves + circle-vs-box push-out gives clean wall sliding.
   e.x += vx * DT;
-  let hit = resolveTiles(w, e, r, map, enemy);
+  const hitX = resolveTiles(w, e, r, map, enemy);
+  if (hitX && enemy && "vx" in e) (e as { vx: number }).vx = 0; // stop pushing into wall
   e.y += vy * DT;
-  hit = resolveTiles(w, e, r, map, enemy) || hit;
+  const hitY = resolveTiles(w, e, r, map, enemy);
+  if (hitY && enemy && "vy" in e) (e as { vy: number }).vy = 0; // stop pushing into wall
   resolveProps(e, r, props);
   resolveTiles(w, e, r, map, enemy);
-  return hit;
+  return hitX || hitY;
 }
 
 function keepOutOfSafeZone(e: Enemy) {
@@ -365,10 +382,15 @@ function killEnemy(w: World, e: Enemy) {
   e.alive = false;
   e.state = "dead";
   e.vx = e.vy = 0;
+  e.path = [];
+  e.pathI = 0;
+  e.pathPending = false;
+  pathScheduler.cancel(e.id);
   w.kills++;
   if (e.kind === "king") {
     w.quest.bossDead = true;
     w.quest.bossShut = false;
+    invalidateNav(w);
     w.fx.hitstop = 0.25;
     w.fx.shake = 1;
     fx(w, "bigpoof", e.map, e.x, e.y, 0, 0, 40);
@@ -404,6 +426,7 @@ function breakProp(w: World, b: Breakable) {
     fx(w, "shards", b.map, b.x, b.y, 0, 0, 14);
     sfx(w, "smash");
     w.fx.shake = Math.max(w.fx.shake, 0.12);
+    invalidateNav(w);
     rollDrop(w, b.map, b.x, b.y, 0.45, 0.12, 0.25);
   }
 }
@@ -528,6 +551,7 @@ function updatePlayer(w: World, input: InputFrame) {
       if (w.quest.hasKey) {
         w.quest.gateOpen = true;
         w.quest.hasKey = false;
+        invalidateNav(w);
         w.fx.shake = 0.45;
         sfx(w, "gate");
         fx(w, "dust", "dungeon", 8, GATE_ROW + 0.9, 0, 0, 18);
@@ -616,17 +640,32 @@ function swordHits(w: World) {
   }
 }
 
-// ── Navigation ──────────────────────────────────────────────────────────────
-/** Snapshot of where monsters may walk in this map right now (pots and gates change). */
-function buildNav(w: World, map: MapId): Nav {
+// ── Navigation & Caching ───────────────────────────────────────────────────
+
+let navCacheAI = { over: null as Nav | null, dungeon: null as Nav | null, revision: -1 };
+let navCacheHero = { over: null as Nav | null, dungeon: null as Nav | null, revision: -1 };
+
+/** Invalidate cached navigation grids whenever tiles change state. */
+export function invalidateNav(w: World) {
+  w.navRevision = (w.navRevision ?? 0) + 1;
+  // If tiles changed state, prompt active hunters to adapt their route
+  for (const e of w.enemies) {
+    if (e.alive && (e.state === "chase" || e.state === "return")) {
+      e.repathT = Math.min(e.repathT, 0.05);
+    }
+  }
+}
+
+/** Snapshot of where monsters or heroes may walk in this map right now. */
+function buildNav(w: World, map: MapId, forAI = true): Nav {
   const m = MAPS[map];
   const solid = new Uint8Array(m.w * m.h);
   for (let ty = 0; ty < m.h; ty++) {
-    for (let tx = 0; tx < m.w; tx++) if (solidFor(w, map, tx, ty, true)) solid[ty * m.w + tx] = 1;
+    for (let tx = 0; tx < m.w; tx++) if (solidFor(w, map, tx, ty, forAI)) solid[ty * m.w + tx] = 1;
   }
   // Pots, the key pedestal and the chest block the tiles they stand on.
   for (const c of propCircles(w, map)) {
-    const s = c.r - 0.08;
+    const s = forAI ? c.r - 0.08 : 0;
     for (let ty = Math.floor(c.y - s); ty <= Math.floor(c.y + s); ty++) {
       for (let tx = Math.floor(c.x - s); tx <= Math.floor(c.x + s); tx++) {
         if (tx >= 0 && ty >= 0 && tx < m.w && ty < m.h) solid[ty * m.w + tx] = 1;
@@ -634,7 +673,7 @@ function buildNav(w: World, map: MapId): Nav {
     }
   }
   // Monsters never set foot in the spawn sanctuary, so they don't plan routes through it.
-  if (map === "over") {
+  if (forAI && map === "over") {
     const R = SAFE_ZONE.r + 0.25;
     for (let ty = Math.floor(SAFE_ZONE.y - R); ty <= Math.floor(SAFE_ZONE.y + R); ty++) {
       for (let tx = Math.floor(SAFE_ZONE.x - R); tx <= Math.floor(SAFE_ZONE.x + R); tx++) {
@@ -643,7 +682,22 @@ function buildNav(w: World, map: MapId): Nav {
       }
     }
   }
-  return { w: m.w, h: m.h, solid };
+  return { w: m.w, h: m.h, solid, map, revision: w.navRevision };
+}
+
+export function getAllNav(w: World, forAI = true): Record<MapId, Nav> {
+  const cache = forAI ? navCacheAI : navCacheHero;
+  if (cache.revision === w.navRevision && cache.over && cache.dungeon) {
+    return { over: cache.over, dungeon: cache.dungeon };
+  }
+  cache.over = buildNav(w, "over", forAI);
+  cache.dungeon = buildNav(w, "dungeon", forAI);
+  cache.revision = w.navRevision;
+  return { over: cache.over, dungeon: cache.dungeon };
+}
+
+export function getNav(w: World, map: MapId, forAI = true): Nav {
+  return getAllNav(w, forAI)[map];
 }
 
 /**
@@ -651,16 +705,7 @@ function buildNav(w: World, map: MapId): Nav {
  * sanctuary is not blocked). Used by the touch controls' tap-to-move routing.
  */
 export function heroNav(w: World, map: MapId): Nav {
-  const m = MAPS[map];
-  const solid = new Uint8Array(m.w * m.h);
-  for (let ty = 0; ty < m.h; ty++) {
-    for (let tx = 0; tx < m.w; tx++) if (solidFor(w, map, tx, ty, false)) solid[ty * m.w + tx] = 1;
-  }
-  for (const c of propCircles(w, map)) {
-    const tx = Math.floor(c.x), ty = Math.floor(c.y);
-    if (tx >= 0 && ty >= 0 && tx < m.w && ty < m.h) solid[ty * m.w + tx] = 1;
-  }
-  return { w: m.w, h: m.h, solid };
+  return getAllNav(w, false)[map];
 }
 
 interface Steer {
@@ -671,42 +716,90 @@ interface Steer {
 }
 
 /**
- * Where to walk next on the way to (gx, gy): straight at it when the way is
- * clear, otherwise along an A* route that is re-planned a few times a second
- * (and immediately if the goal wanders off). Waypoints already in plain view
- * are skipped, which smooths the grid route into natural diagonals.
+ * Where to walk next on the way to (gx, gy) across chunks and portals:
+ * - Straight at it when the way is clear on the same map with ample clearance.
+ * - Otherwise through the per-tick pathfinding budget to prevent frame hitching.
+ * - Graceful fallback to standoff positions when unreachable (never freeze or vibrate against walls).
  */
-function navigate(nav: Nav, e: Enemy, size: NavSize, gx: number, gy: number): Steer {
-  if (lineClear(nav, e.x, e.y, gx, gy, e.r)) {
-    e.path = []; e.pathI = 0; e.pathOk = true;
+function navigate(w: World, allNav: Record<MapId, Nav>, e: Enemy, size: NavSize, gx: number, gy: number, goalMap: MapId): Steer {
+  const nav = allNav[e.map];
+  // 1. Direct line of sight on same map with safety margin
+  if (e.map === goalMap && lineClear(nav, e.x, e.y, gx, gy, e.r + 0.06)) {
+    e.path = []; e.pathI = 0; e.pathOk = true; e.pathPending = false;
     e.pgx = gx; e.pgy = gy;
     return { x: gx, y: gy, ok: true };
   }
+
+  // 2. Repath check with per-tick pathfinding budget
   e.repathT -= DT;
-  if (e.repathT <= 0 || Math.hypot(gx - e.pgx, gy - e.pgy) > 1.0) {
-    const res = findPath(nav, size, e.x, e.y, gx, gy);
-    e.path = res.pts; e.pathI = 0; e.pathOk = res.ok;
-    e.pgx = gx; e.pgy = gy;
-    // Staggered so a whole pack never re-plans on the same tick.
-    e.repathT = 0.32 + (e.id % 7) * 0.025;
+  const goalDrift = Math.hypot(gx - e.pgx, gy - e.pgy);
+  if ((e.repathT <= 0 || goalDrift > 1.2) && !e.pathPending) {
+    const priority = 1000 - Math.hypot(gx - e.x, gy - e.y);
+    const immediate = pathScheduler.requestPath(allNav, {
+      id: e.id,
+      size,
+      startMap: e.map,
+      sx: e.x,
+      sy: e.y,
+      goalMap,
+      gx,
+      gy,
+      isAI: true,
+      priority,
+      callback: (res) => {
+        e.path = res.pts;
+        e.pathI = 0;
+        e.pathOk = res.ok;
+        e.pathPending = false;
+        e.pgx = gx;
+        e.pgy = gy;
+        e.repathT = 0.32 + (e.id % 7) * 0.03;
+      },
+    });
+
+    if (immediate) {
+      e.path = immediate.pts;
+      e.pathI = 0;
+      e.pathOk = immediate.ok;
+      e.pathPending = false;
+      e.pgx = gx;
+      e.pgy = gy;
+      e.repathT = 0.32 + (e.id % 7) * 0.03;
+    } else {
+      e.pathPending = true;
+    }
   }
+
+  // 3. Waypoint progression
   const pts = e.path, n = pts.length / 2;
   while (e.pathI < n && Math.hypot(pts[e.pathI * 2] - e.x, pts[e.pathI * 2 + 1] - e.y) < 0.3) e.pathI++;
   for (let k = 0; k < 2 && e.pathI + 1 < n; k++) {
     if (!lineClear(nav, e.x, e.y, pts[(e.pathI + 1) * 2], pts[(e.pathI + 1) * 2 + 1], e.r)) break;
     e.pathI++;
   }
-  if (e.pathI < n) return { x: pts[e.pathI * 2], y: pts[e.pathI * 2 + 1], ok: e.pathOk };
-  // Route used up: either we've arrived, or this is as close as it gets — in
-  // which case keep leaning toward the target; the stuck timer decides when to quit.
-  return { x: gx, y: gy, ok: e.pathOk };
+  if (e.pathI < n) {
+    return { x: pts[e.pathI * 2], y: pts[e.pathI * 2 + 1], ok: e.pathOk };
+  }
+
+  // 4. Route exhausted:
+  if (e.pathOk && e.map === goalMap) {
+    return { x: gx, y: gy, ok: true };
+  }
+
+  // Graceful no-path fallback:
+  // Instead of driving face-first into blocking walls, standoff smoothly.
+  const standoff = getStandoffPoint(nav, e.x, e.y, gx, gy, e.r);
+  return { x: standoff.x, y: standoff.y, ok: false };
 }
 
-function toward(e: Enemy, x: number, y: number, speed: number): [number, number] {
+function toward(nav: Nav, e: Enemy, x: number, y: number, speed: number): [number, number] {
   const dx = x - e.x, dy = y - e.y;
   const d = Math.hypot(dx, dy);
   if (d < 0.04) return [0, 0];
-  return [(dx / d) * speed, (dy / d) * speed];
+  const vx = (dx / d) * speed;
+  const vy = (dy / d) * speed;
+  // Apply wall slide vector so monsters slide gracefully along walls instead of vibrating
+  return wallSlideVector(nav, e.x, e.y, vx, vy, e.r);
 }
 
 /**
@@ -726,13 +819,19 @@ function trackStuck(e: Enemy, engaged: boolean) {
 /** Is the hero somewhere a monster on this map is allowed to hunt them? */
 function huntable(w: World, e: Enemy) {
   const p = w.player;
-  return !p.dead && p.map === e.map && !w.transition && !inSafeZone(p);
+  if (p.dead || w.transition || inSafeZone(p)) return false;
+  if (p.map === e.map) return true;
+  // If player is on another map, AI may hunt only if an AI-traversable portal exists
+  const portals = getPortals();
+  return portals.some((pt) => pt.traversableByAI);
 }
 
 function startChase(e: Enemy) {
   e.state = "chase"; e.stateT = 0;
   e.stuckT = 0; e.anchorT = 0; e.ax = e.x; e.ay = e.y;
   e.repathT = 0; e.calmT = 0;
+  e.path = []; e.pathI = 0; e.pathPending = false; e.pathOk = true;
+  pathScheduler.cancel(e.id);
 }
 
 function spotHero(w: World, e: Enemy) {
@@ -751,10 +850,25 @@ function giveUp(e: Enemy) {
   e.calmT = GLOOB.calm;
   e.stuckT = 0; e.anchorT = 0; e.ax = e.x; e.ay = e.y;
   e.repathT = 0;
+  e.path = [];
+  e.pathI = 0;
+  e.pathPending = false;
+  e.pathOk = true;
+  e.pgx = e.hx; e.pgy = e.hy;
+  pathScheduler.cancel(e.id);
+  // Turn to face home immediately so the monster doesn't moonwalk backwards
+  const dx = e.hx - e.x, dy = e.hy - e.y;
+  if (Math.hypot(dx, dy) > 0.05) {
+    e.face = Math.atan2(dy, dx);
+  }
+  // Cut forward momentum so it turns cleanly toward home
+  e.vx = 0;
+  e.vy = 0;
 }
 
-function updateGloob(w: World, e: Enemy, nav: Nav, props: { x: number; y: number; r: number }[]) {
+function updateGloob(w: World, e: Enemy, allNav: Record<MapId, Nav>, props: { x: number; y: number; r: number }[]) {
   const p = w.player;
+  const nav = allNav[e.map];
   let tvx = 0, tvy = 0;
   e.stateT -= DT;
   e.calmT = Math.max(0, e.calmT - DT);
@@ -773,7 +887,7 @@ function updateGloob(w: World, e: Enemy, nav: Nav, props: { x: number; y: number
           if (lineClear(nav, e.x, e.y, tx, ty, e.r)) { e.tx = tx; e.ty = ty; break; }
         }
       }
-      if (dist(e.x, e.y, e.tx, e.ty) > 0.15) [tvx, tvy] = toward(e, e.tx, e.ty, GLOOB.wander);
+      if (dist(e.x, e.y, e.tx, e.ty) > 0.15) [tvx, tvy] = toward(nav, e, e.tx, e.ty, GLOOB.wander);
       if (spots) spotHero(w, e);
       break;
     }
@@ -782,15 +896,15 @@ function updateGloob(w: World, e: Enemy, nav: Nav, props: { x: number; y: number
       // only while they're still right there — and never stray absurdly far from home.
       const heroHome = dist(p.x, p.y, e.hx, e.hy);
       const keep = hunt && (heroHome < GLOOB.territory || (pd < GLOOB.forget && homeD < GLOOB.territory + 3));
-      const s = navigate(nav, e, 1, p.x, p.y);
-      [tvx, tvy] = toward(e, s.x, s.y, GLOOB.chase);
+      const s = navigate(w, allNav, e, 1, p.x, p.y, p.map);
+      [tvx, tvy] = toward(nav, e, s.x, s.y, GLOOB.chase);
       trackStuck(e, s.ok && pd < 2.2);
       if (!keep || e.stuckT >= GLOOB.giveUp) giveUp(e);
       break;
     }
     case "return": {
-      const s = navigate(nav, e, 1, e.hx, e.hy);
-      [tvx, tvy] = toward(e, s.x, s.y, GLOOB.wander * 1.5);
+      const s = navigate(w, allNav, e, 1, e.hx, e.hy, e.map);
+      [tvx, tvy] = toward(nav, e, s.x, s.y, GLOOB.wander * 1.5);
       trackStuck(e, false);
       if (homeD < 0.6) { e.state = "idle"; e.stateT = 0.5; e.tx = e.hx; e.ty = e.hy; }
       else if (spots) spotHero(w, e);
@@ -804,8 +918,15 @@ function updateGloob(w: World, e: Enemy, nav: Nav, props: { x: number; y: number
       break;
     }
   }
-  if (e.state !== "hurt") [e.vx, e.vy] = approach(e.vx, e.vy, tvx, tvy, 18 * DT);
-  if (Math.hypot(e.vx, e.vy) > 0.2 && e.state !== "hurt") e.face = Math.atan2(e.vy, e.vx);
+  if (e.state !== "hurt") {
+    [e.vx, e.vy] = approach(e.vx, e.vy, tvx, tvy, 18 * DT);
+    // Face the direction of active travel/steering so monsters never moonwalk
+    if (Math.hypot(tvx, tvy) > 0.1) {
+      e.face = Math.atan2(tvy, tvx);
+    } else if (Math.hypot(e.vx, e.vy) > 0.1) {
+      e.face = Math.atan2(e.vy, e.vx);
+    }
+  }
   moveBody(w, e, e.vx, e.vy, e.r, e.map, true, props);
   keepOutOfSafeZone(e);
 }
@@ -824,9 +945,10 @@ function startInflate(w: World, e: Enemy) {
   sfx(w, "inflate");
 }
 
-function updateKing(w: World, e: Enemy, nav: Nav, props: { x: number; y: number; r: number }[]) {
+function updateKing(w: World, e: Enemy, allNav: Record<MapId, Nav>, props: { x: number; y: number; r: number }[]) {
   const p = w.player;
   const q = w.quest;
+  const nav = allNav[e.map];
   let tvx = 0, tvy = 0;
   e.stateT -= DT;
   e.rangedCd = Math.max(0, e.rangedCd - DT);
@@ -839,6 +961,7 @@ function updateKing(w: World, e: Enemy, nav: Nav, props: { x: number; y: number;
       if (p.map === "dungeon" && p.y < BOSS_ROOM_MAX_Y - 1.4 && !p.dead) {
         q.bossAwake = true;
         q.bossShut = true;
+        invalidateNav(w);
         e.state = "idle";
         e.stateT = 1.3;
         w.fx.shake = 0.6;
@@ -853,8 +976,8 @@ function updateKing(w: World, e: Enemy, nav: Nav, props: { x: number; y: number;
       if (e.stateT <= 0) { e.state = "chase"; e.stateT = 0.9 + rand(w) * 0.6; }
       break;
     case "chase": {
-      const s = navigate(nav, e, 2, p.x, p.y);
-      [tvx, tvy] = toward(e, s.x, s.y, e.enraged ? KING.chaseRage : KING.chase);
+      const s = navigate(w, allNav, e, 2, p.x, p.y, p.map);
+      [tvx, tvy] = toward(nav, e, s.x, s.y, e.enraged ? KING.chaseRage : KING.chase);
       const reach = kingCanReach(e, s, p);
       e.unreachT = reach ? Math.max(0, e.unreachT - DT * 2) : e.unreachT + DT;
       if (p.dead) break;
@@ -864,7 +987,7 @@ function updateKing(w: World, e: Enemy, nav: Nav, props: { x: number; y: number;
       } else if (e.stateT <= 0) {
         const pd = dist(e.x, e.y, p.x, p.y);
         if (reach && pd > 6.5 && e.rangedCd <= 0 && rand(w) < 0.35) startInflate(w, e);
-        // Only charge down a clear lane — no more faceplanting into pillars on purpose.
+        // Only charge down a clear lane — no faceplanting into pillars.
         else if (reach && lineClear(nav, e.x, e.y, p.x, p.y, e.r * 0.8)) { e.state = "windup"; e.stateT = e.enraged ? 0.42 : 0.6; }
         else e.stateT = 0.25;
       }
@@ -918,7 +1041,10 @@ function updateKing(w: World, e: Enemy, nav: Nav, props: { x: number; y: number;
   if (e.state === "lunge") { e.vx = tvx; e.vy = tvy; }
   else if (e.state === "recover") [e.vx, e.vy] = approach(e.vx, e.vy, 0, 0, 38 * DT); // skid to a halt
   else if (e.state !== "hurt") [e.vx, e.vy] = approach(e.vx, e.vy, tvx, tvy, 12 * DT);
-  if (e.state === "chase" && Math.hypot(e.vx, e.vy) > 0.2) e.face = Math.atan2(e.vy, e.vx);
+  if (e.state === "chase") {
+    if (Math.hypot(tvx, tvy) > 0.1) e.face = Math.atan2(tvy, tvx);
+    else if (Math.hypot(e.vx, e.vy) > 0.1) e.face = Math.atan2(e.vy, e.vx);
+  }
   const hitWall = moveBody(w, e, e.vx, e.vy, e.r, e.map, true, props);
   if (e.state === "lunge" && hitWall) {
     // Splat into a wall: dazed for a good while.
@@ -1064,8 +1190,9 @@ function approachScalar(v: number, t: number, step: number) {
 
 function updateEnemies(w: World) {
   const p = w.player;
-  const props = propCircles(w, p.map);
-  const nav = buildNav(w, p.map);
+  const allNav = getAllNav(w, true);
+  pathScheduler.tick(allNav);
+
   for (const e of w.enemies) {
     e.px = e.x; e.py = e.y;
     e.flash = Math.max(0, e.flash - DT);
@@ -1082,9 +1209,36 @@ function updateEnemies(w: World) {
       }
       continue;
     }
-    if (e.map !== p.map) continue;
-    if (e.kind === "king") updateKing(w, e, nav, props);
-    else updateGloob(w, e, nav, props);
+
+    // Portal traversal for AI (only when portal is marked traversableByAI)
+    const activePortals = getPortals();
+    for (const pt of activePortals) {
+      if (!pt.traversableByAI) continue;
+      const from = chunkToUnified(pt.fromChunk, pt.fromTile.x, pt.fromTile.y);
+      if (e.map === from.map && dist(e.x, e.y, from.x + 0.5, from.y + 0.5) < 0.6) {
+        const to = chunkToUnified(pt.toChunk, pt.toTile.x, pt.toTile.y);
+        e.map = to.map;
+        e.x = e.px = to.x + 0.5;
+        e.y = e.py = to.y + 0.5;
+        e.path = [];
+        e.pathI = 0;
+        e.repathT = 0;
+        break;
+      }
+    }
+
+    const enemyProps = propCircles(w, e.map);
+    if (e.map !== p.map) {
+      // Monsters on another map update if they are active
+      if (e.state === "chase" || e.state === "return") {
+        if (e.kind === "king") updateKing(w, e, allNav, enemyProps);
+        else updateGloob(w, e, allNav, enemyProps);
+      }
+      continue;
+    }
+
+    if (e.kind === "king") updateKing(w, e, allNav, enemyProps);
+    else updateGloob(w, e, allNav, enemyProps);
   }
 }
 

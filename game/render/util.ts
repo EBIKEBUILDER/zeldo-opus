@@ -104,6 +104,21 @@ export function merge(name: string, parts: Mesh[], mat: StandardMaterial, shade 
   return m;
 }
 
+export function mergeSmooth(name: string, parts: Mesh[], mat: StandardMaterial): Mesh {
+  const m = Mesh.MergeMeshes(parts, true, true)!;
+  m.name = name;
+  const nrm = m.getVerticesData(VertexBuffer.NormalKind);
+  if (nrm) {
+    for (let i = 0; i < nrm.length; i += 3) {
+      const l = Math.hypot(nrm[i], nrm[i + 1], nrm[i + 2]) || 1;
+      nrm[i] /= l; nrm[i + 1] /= l; nrm[i + 2] /= l;
+    }
+    m.setVerticesData(VertexBuffer.NormalKind, nrm);
+  }
+  m.material = mat;
+  return m;
+}
+
 const tmpS = new Vector3(), tmpT = new Vector3(), tmpQ = new Quaternion(), tmpM = new Matrix();
 
 export interface Placement {

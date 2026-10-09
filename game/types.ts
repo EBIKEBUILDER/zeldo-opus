@@ -74,6 +74,10 @@ export interface Enemy {
   pgx: number; pgy: number;
   /** False when the goal can't be reached; the route ends as close as possible. */
   pathOk: boolean;
+  /** True while a repath request is queued in the per-tick pathfinding budget. */
+  pathPending?: boolean;
+  /** Seconds spent bumping directly against a wall (used for graceful sliding/fallback). */
+  wallStuckT?: number;
 
   // ── Pursuit bookkeeping ──
   /** Seconds of chasing without making any headway. */
@@ -214,6 +218,8 @@ export interface World {
   outcome: "victory" | "gameover" | null;
   /** Context action hint ("Read", "Open") shown by the HUD. */
   prompt: string | null;
+  /** Monotonic revision bumped when tiles change state (pots break, gate opens/shuts). */
+  navRevision: number;
   events: GameEvent[];
 }
 
